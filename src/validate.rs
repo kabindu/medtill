@@ -97,3 +97,71 @@ pub fn parse_phone(raw: &str) -> Result<String, String> {
     }
     Ok(trimmed.to_string())
 }
+
+/// Barcode is optional (`Ok(None)` when left empty).
+///
+/// Digits-only codes of a standard retail length (EAN-8, UPC-A, EAN-13,
+/// GTIN-14) must pass their check digit: the last digit is calculated from
+/// the others, so a misread or mistyped digit is caught here instead of
+/// creating a product that no scanner will ever match. Any other code (for
+/// example a shop-printed label) just needs 3–40 letters, digits or dashes.
+pub fn parse_barcode(raw: &str) -> Result<Option<String>, String> {
+    let code = raw.trim();
+    if code.is_empty() {
+        return Ok(None);
+    }
+
+    let all_digits = code.chars().all(|c| c.is_ascii_digit());
+    if all_digits && matches!(code.len(), 8 | 12 | 13 | 14) {
+        if !gtin_check_digit_ok(code) {
+            return Err(format!(
+                "Barcode {code} has a wrong check digit — scan it again or check the digits."
+            ));
+        }
+        return Ok(Some(code.to_string()));
+    }
+
+    let valid = (3..=40).contains(&code.len())
+        && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        return Err("Barcode should be 3–40 letters or digits.".to_string());
+    }
+    Ok(Some(code.to_string()))
+}
+
+/// GTIN check digit (EAN-8/UPC-A/EAN-13/GTIN-14): counting from the right
+/// of the code without its last digit, digits are weighted 3, 1, 3, 1, ...
+/// and the check digit is whatever brings the sum up to a multiple of 10.
+fn gtin_check_digit_ok(code: &str) -> bool {
+    let digits: Vec<u32> = code.bytes().map(|b| u32::from(b - b'0')).collect();
+    let Some((check, body)) = digits.split_last() else {
+        return false;
+    };
+    let sum: u32 = body
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, digit)| if i % 2 == 0 { digit * 3 } else { *digit })
+        .sum();
+    (10 - sum % 10) % 10 == *check
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn barcode_check_digits() {
+        // The code from a real box (Kenya prefix 616).
+        assert_eq!(parse_barcode("6162004002795"), Ok(Some("6162004002795".to_string())));
+        assert_eq!(parse_barcode("  6162004002795 "), Ok(Some("6162004002795".to_string())));
+        // One digit changed: rejected.
+        assert!(parse_barcode("6162004002796").is_err());
+        assert!(parse_barcode("6162004002785").is_err());
+        // Empty is fine (barcode is optional).
+        assert_eq!(parse_barcode(""), Ok(None));
+        // Shop-printed codes.
+        assert_eq!(parse_barcode("MT-000123"), Ok(Some("MT-000123".to_string())));
+        assert!(parse_barcode("a b").is_err());
+    }
+}

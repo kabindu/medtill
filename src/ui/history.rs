@@ -3,6 +3,7 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::ui::notify::Notice;
+use crate::ui::theme;
 
 /// Which half of the history screen is showing — just a tag the UI flips
 /// between frames, so `Copy` is free and correct (there's no owned data).
@@ -52,6 +53,8 @@ fn render_sales(ui: &mut egui::Ui, conn: &Connection, state: &mut HistoryState) 
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+        theme::compact_list(ui);
+
         for sale in &sales {
             let heading = format!(
                 "Sale #{}  —  {}  —  {}  —  Total {:.2}",
@@ -64,19 +67,20 @@ fn render_sales(ui: &mut egui::Ui, conn: &Connection, state: &mut HistoryState) 
                 .id_salt(("sale_history", sale.id))
                 .show(ui, |ui| {
                     egui::Grid::new(("sale_items", sale.id))
-                        .striped(true)
+                        .spacing(egui::vec2(14.0, 6.0))
+                        .with_row_color(theme::stripe_rows)
                         .show(ui, |ui| {
-                            ui.strong("Product");
-                            ui.strong("Qty");
-                            ui.strong("Unit price");
-                            ui.strong("Subtotal");
+                            theme::column_header(ui, "Product");
+                            theme::column_header(ui, "Qty");
+                            theme::column_header(ui, "Unit price");
+                            theme::column_header(ui, "Subtotal");
                             ui.end_row();
 
                             for item in &sale.items {
                                 ui.label(&item.product_name);
-                                ui.label(item.quantity.to_string());
-                                ui.label(format!("{:.2}", item.unit_price.as_major()));
-                                ui.label(format!("{:.2}", item.subtotal().as_major()));
+                                theme::number_cell(ui, item.quantity.to_string());
+                                theme::number_cell(ui, format!("{:.2}", item.unit_price.as_major()));
+                                theme::number_cell(ui, format!("{:.2}", item.subtotal().as_major()));
                                 ui.end_row();
                             }
                         });
@@ -100,6 +104,8 @@ fn render_deliveries(ui: &mut egui::Ui, conn: &Connection, state: &mut HistorySt
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+        theme::compact_list(ui);
+
         for delivery in &deliveries {
             let invoice = if delivery.invoice_number.is_empty() {
                 "—"
@@ -121,23 +127,24 @@ fn render_deliveries(ui: &mut egui::Ui, conn: &Connection, state: &mut HistorySt
                         ui.label(format!("Notes: {}", delivery.notes));
                     }
                     egui::Grid::new(("delivery_items", delivery.id))
-                        .striped(true)
+                        .spacing(egui::vec2(14.0, 6.0))
+                        .with_row_color(theme::stripe_rows)
                         .show(ui, |ui| {
-                            ui.strong("Product");
-                            ui.strong("Qty");
-                            ui.strong("Unit cost");
-                            ui.strong("Batch");
-                            ui.strong("Expiry");
-                            ui.strong("Line cost");
+                            theme::column_header(ui, "Product");
+                            theme::column_header(ui, "Qty");
+                            theme::column_header(ui, "Unit cost");
+                            theme::column_header(ui, "Batch");
+                            theme::column_header(ui, "Expiry");
+                            theme::column_header(ui, "Line cost");
                             ui.end_row();
 
                             for item in &delivery.items {
                                 ui.label(&item.product_name);
-                                ui.label(item.quantity.to_string());
-                                ui.label(format!("{:.2}", item.unit_cost.as_major()));
+                                theme::number_cell(ui, item.quantity.to_string());
+                                theme::number_cell(ui, format!("{:.2}", item.unit_cost.as_major()));
                                 ui.label(&item.batch_number);
                                 ui.label(item.expiry_date.to_string());
-                                ui.label(format!("{:.2}", item.line_cost().as_major()));
+                                theme::number_cell(ui, format!("{:.2}", item.line_cost().as_major()));
                                 ui.end_row();
                             }
                         });

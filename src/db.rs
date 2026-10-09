@@ -36,7 +36,9 @@ pub fn init_db(path: &str) -> Result<Connection> {
             cost_price_cents  INTEGER NOT NULL,
             stock_quantity    INTEGER NOT NULL DEFAULT 0,
             supplier_id       INTEGER,
-            reorder_level     INTEGER NOT NULL DEFAULT 0
+            reorder_level     INTEGER NOT NULL DEFAULT 0,
+            is_active         INTEGER NOT NULL DEFAULT 1,
+            barcode           TEXT
         );
 
         CREATE TABLE IF NOT EXISTS suppliers (
@@ -45,7 +47,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             contact_phone   TEXT NOT NULL DEFAULT '',
             contact_email   TEXT NOT NULL DEFAULT '',
             address         TEXT NOT NULL DEFAULT '',
-            notes           TEXT NOT NULL DEFAULT ''
+            notes           TEXT NOT NULL DEFAULT '',
+            is_active       INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS deliveries (
@@ -83,16 +86,65 @@ pub fn init_db(path: &str) -> Result<Connection> {
         ",
     )?;
 
+    // A brand-new database already has every column from the CREATE TABLEs
+    // above. An existing medtill.sqlite (your current one) was created before
+    // `is_active` existed, so this adds it without touching any data.
+    migrate(&conn)?;
+
     Ok(conn)
+}
+
+// ---------- Schema upgrades ----------
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    // `table` only ever comes from the fixed names in `migrate` below, never
+    // from user input, so building the SQL with format! is safe here.
+    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let found = stmt.exists(params![column])?;
+    Ok(found)
+}
+
+/// Brings an existing database up to date. Safe to run on every startup:
+/// each step checks first and only adds what's missing.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "products", "is_active")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !has_column(conn, "suppliers", "is_active")? {
+        conn.execute(
+            "ALTER TABLE suppliers ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !has_column(conn, "products", "barcode")? {
+        conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT", [])?;
+    }
+    // No two active products may share a barcode, or one scan could match
+    // two medicines. Deleted (inactive) products are left out, so a deleted
+    // product's barcode can be reused for its replacement.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_active_barcode
+         ON products(barcode)
+         WHERE barcode IS NOT NULL AND is_active = 1",
+        [],
+    )?;
+    Ok(())
 }
 
 // ---------- Products ----------
 
+/// Active (not deleted) products only, sorted A-Z ignoring upper/lower case.
 pub fn list_products(conn: &Connection) -> Result<Vec<Product>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, category, batch_number, expiry_date, price_cents,
-                cost_price_cents, stock_quantity, supplier_id, reorder_level
-         FROM products ORDER BY name",
+                cost_price_cents, stock_quantity, supplier_id, reorder_level, barcode
+         FROM products
+         WHERE is_active = 1
+         ORDER BY name COLLATE NOCASE",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -107,6 +159,7 @@ pub fn list_products(conn: &Connection) -> Result<Vec<Product>> {
             stock_quantity: row.get(7)?,
             supplier_id: row.get(8)?,
             reorder_level: row.get(9)?,
+            barcode: row.get(10)?,
         })
     })?;
 
@@ -117,8 +170,8 @@ pub fn add_product(conn: &Connection, product: &Product) -> Result<i64> {
     conn.execute(
         "INSERT INTO products
             (name, category, batch_number, expiry_date, price_cents,
-             cost_price_cents, stock_quantity, supplier_id, reorder_level)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             cost_price_cents, stock_quantity, supplier_id, reorder_level, barcode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             product.name,
             product.category,
@@ -129,6 +182,7 @@ pub fn add_product(conn: &Connection, product: &Product) -> Result<i64> {
             product.stock_quantity,
             product.supplier_id,
             product.reorder_level,
+            product.barcode,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -138,8 +192,8 @@ pub fn update_product(conn: &Connection, product: &Product) -> Result<()> {
     conn.execute(
         "UPDATE products SET name=?1, category=?2, batch_number=?3, expiry_date=?4,
             price_cents=?5, cost_price_cents=?6, stock_quantity=?7, supplier_id=?8,
-            reorder_level=?9
-         WHERE id=?10",
+            reorder_level=?9, barcode=?10
+         WHERE id=?11",
         params![
             product.name,
             product.category,
@@ -150,6 +204,7 @@ pub fn update_product(conn: &Connection, product: &Product) -> Result<()> {
             product.stock_quantity,
             product.supplier_id,
             product.reorder_level,
+            product.barcode,
             product.id,
         ],
     )?;
@@ -164,11 +219,23 @@ pub fn adjust_stock(conn: &Connection, product_id: i64, delta: i64) -> Result<()
     Ok(())
 }
 
+/// "Deletes" a product by hiding it. The row stays in the database because
+/// past sale and delivery lines still point at it, so erasing it for real
+/// would break history.
+pub fn deactivate_product(conn: &Connection, product_id: i64) -> Result<()> {
+    conn.execute("UPDATE products SET is_active = 0 WHERE id = ?1", params![product_id])?;
+    Ok(())
+}
+
 // ---------- Suppliers ----------
 
+/// Active (not deleted) suppliers only, sorted A-Z ignoring upper/lower case.
 pub fn list_suppliers(conn: &Connection) -> Result<Vec<Supplier>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, contact_phone, contact_email, address, notes FROM suppliers ORDER BY name",
+        "SELECT id, name, contact_phone, contact_email, address, notes
+         FROM suppliers
+         WHERE is_active = 1
+         ORDER BY name COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Supplier {
@@ -198,7 +265,6 @@ pub fn add_supplier(conn: &Connection, supplier: &Supplier) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-/// New: updates an existing supplier's details in place.
 pub fn update_supplier(conn: &Connection, supplier: &Supplier) -> Result<()> {
     conn.execute(
         "UPDATE suppliers SET name=?1, contact_phone=?2, contact_email=?3, address=?4, notes=?5
@@ -212,6 +278,13 @@ pub fn update_supplier(conn: &Connection, supplier: &Supplier) -> Result<()> {
             supplier.id,
         ],
     )?;
+    Ok(())
+}
+
+/// "Deletes" a supplier by hiding it. Their past deliveries still show in
+/// History with the supplier's name, because those rows stay in place.
+pub fn deactivate_supplier(conn: &Connection, supplier_id: i64) -> Result<()> {
+    conn.execute("UPDATE suppliers SET is_active = 0 WHERE id = ?1", params![supplier_id])?;
     Ok(())
 }
 
@@ -284,7 +357,8 @@ pub fn record_sale(conn: &mut Connection, sale: &Sale) -> Result<i64> {
     tx.commit()?;
     Ok(sale_id)
 }
-// --- Sales & delivery history ---
+
+// ---------- Sales & delivery history ----------
 
 pub fn list_sales(conn: &Connection) -> Result<Vec<SaleRecord>> {
     let mut sale_stmt = conn.prepare(
@@ -322,6 +396,8 @@ pub fn list_sales(conn: &Connection) -> Result<Vec<SaleRecord>> {
 }
 
 pub fn list_deliveries(conn: &Connection) -> Result<Vec<DeliveryRecord>> {
+    // No `is_active` filter here on purpose: History should still show
+    // deliveries from suppliers and products that were later deleted.
     let mut delivery_stmt = conn.prepare(
         "SELECT d.id, d.supplier_id, s.name, d.delivery_date, d.invoice_number, d.notes
          FROM deliveries d
@@ -368,7 +444,8 @@ pub fn list_deliveries(conn: &Connection) -> Result<Vec<DeliveryRecord>> {
 
     Ok(deliveries)
 }
-// --- Dashboard aggregates ---
+
+// ---------- Dashboard aggregates ----------
 
 pub fn today_sales_total(conn: &Connection) -> Result<Cents> {
     let today_str = date_to_str(chrono::Local::now().date_naive());
@@ -385,7 +462,7 @@ pub fn today_sales_total(conn: &Connection) -> Result<Cents> {
 
 pub fn count_low_stock(conn: &Connection) -> Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM products WHERE stock_quantity <= reorder_level",
+        "SELECT COUNT(*) FROM products WHERE is_active = 1 AND stock_quantity <= reorder_level",
         [],
         |row| row.get(0),
     )
@@ -395,54 +472,13 @@ pub fn count_expiring_soon(conn: &Connection, within_days: i64) -> Result<i64> {
     let today = chrono::Local::now().date_naive();
     let cutoff = today + chrono::Duration::days(within_days);
     conn.query_row(
-        "SELECT COUNT(*) FROM products WHERE expiry_date >= ?1 AND expiry_date <= ?2",
+        "SELECT COUNT(*) FROM products
+         WHERE is_active = 1 AND expiry_date >= ?1 AND expiry_date <= ?2",
         params![date_to_str(today), date_to_str(cutoff)],
         |row| row.get(0),
     )
 }
 
 pub fn count_products(conn: &Connection) -> Result<i64> {
-    conn.query_row("SELECT COUNT(*) FROM products", [], |row| row.get(0))
-}
-
-/// Daily sales totals for the last `days` days, including days with zero
-/// sales (so the chart doesn't silently skip a quiet day). SQLite only
-/// returns rows for dates that actually had a sale, so the gaps are filled
-/// in here rather than in SQL.
-pub fn sales_totals_last_n_days(conn: &Connection, days: i64) -> Result<Vec<(NaiveDate, Cents)>> {
-    let today = chrono::Local::now().date_naive();
-    let start = today - chrono::Duration::days(days - 1);
-
-    let mut stmt = conn.prepare(
-        "SELECT sales.sale_date, SUM(sale_items.unit_price_cents * sale_items.quantity)
-         FROM sale_items
-         JOIN sales ON sales.id = sale_items.sale_id
-         WHERE sales.sale_date >= ?1
-         GROUP BY sales.sale_date",
-    )?;
-    let rows: Vec<(String, i64)> = stmt
-        .query_map(params![date_to_str(start)], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<_>>>()?;
-
-    let totals: std::collections::HashMap<String, i64> = rows.into_iter().collect();
-
-    let mut result = Vec::with_capacity(days as usize);
-    for i in 0..days {
-        let day = start + chrono::Duration::days(i);
-        let cents = *totals.get(&date_to_str(day)).unwrap_or(&0);
-        result.push((day, Cents(cents)));
-    }
-    Ok(result)
-}
-
-pub fn top_products_by_quantity(conn: &Connection, limit: i64) -> Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT product_name, SUM(quantity) AS total_qty
-         FROM sale_items
-         GROUP BY product_name
-         ORDER BY total_qty DESC
-         LIMIT ?1",
-    )?;
-    stmt.query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<_>>>()
+    conn.query_row("SELECT COUNT(*) FROM products WHERE is_active = 1", [], |row| row.get(0))
 }

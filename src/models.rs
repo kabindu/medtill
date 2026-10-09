@@ -50,6 +50,11 @@ pub struct Product {
     pub stock_quantity: u32,
     pub supplier_id: Option<i64>,
     pub reorder_level: u32,
+    /// The code printed under the barcode on the box (e.g. "6162004002795"),
+    /// or `None` for products entered without one. An owned `String` rather
+    /// than a number: barcodes can start with 0 and some label formats mix
+    /// letters and digits, so they're identifiers, not quantities.
+    pub barcode: Option<String>,
 }
 
 impl Product {
@@ -101,6 +106,7 @@ pub enum PaymentMethod {
     Card,
     MobileMoney,
 }
+
 /// A completed sale — a historical record. Unlike CartItem, SaleItem DOES
 /// snapshot the product's name and price at sale time (see below), because
 /// a receipt from last month must stay correct even if that product is
@@ -181,6 +187,7 @@ impl DeliveryItem {
         self.unit_cost * self.quantity
     }
 }
+
 // --- Sales & delivery history (read models) ---
 //
 // `SaleRecord`/`DeliveryRecord` exist only for the history screen. Unlike
