@@ -4,3 +4,8 @@
 *.db
 
 *.sqlite
+
+*.sqlite-wal
+*.sqlite-shm
+/reports
+/receipts

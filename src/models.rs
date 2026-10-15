@@ -1,23 +1,12 @@
+//! The data MedTill works with, and the role/permission table.
+
 use chrono::NaiveDate;
+use std::fmt;
 
-/// Money as integer cents, never as a float. Floats can't represent
-/// amounts like 0.10 exactly in binary, so repeated addition/multiplication
-/// (adding up a cart, computing a delivery's total cost) silently drifts —
-/// unacceptable when real currency is on the line. `Cents` wraps a plain
-/// `i64`, so it's `Copy`: passing it around, returning it from a function,
-/// summing a list of them — none of that touches the heap or clones anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Money in whole cents. Never a float: 0.10 can't be stored exactly in
+/// binary, so float totals drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Cents(pub i64);
-
-impl Cents {
-    pub fn from_major(units: f64) -> Self {
-        Cents((units * 100.0).round() as i64)
-    }
-
-    pub fn as_major(&self) -> f64 {
-        self.0 as f64 / 100.0
-    }
-}
 
 impl std::ops::Add for Cents {
     type Output = Cents;
@@ -26,241 +15,407 @@ impl std::ops::Add for Cents {
     }
 }
 
-impl std::ops::Mul<u32> for Cents {
+impl std::ops::Sub for Cents {
     type Output = Cents;
-    fn mul(self, qty: u32) -> Cents {
-        Cents(self.0 * qty as i64)
+    fn sub(self, other: Cents) -> Cents {
+        Cents(self.0 - other.0)
     }
 }
 
-/// A drug/product on the shelf. This is the single owner of everything
-/// about that product — name, price, stock level. Nothing else in the app
-/// keeps its own copy of this data; other types refer to it by `id` instead
-/// (see `CartItem` below), so there's exactly one place price or stock can
-/// ever be wrong.
+impl std::ops::Mul<i64> for Cents {
+    type Output = Cents;
+    fn mul(self, qty: i64) -> Cents {
+        Cents(self.0 * qty)
+    }
+}
+
+impl std::iter::Sum for Cents {
+    fn sum<I: Iterator<Item = Cents>>(iter: I) -> Cents {
+        Cents(iter.map(|c| c.0).sum())
+    }
+}
+
+/// `Cents(123456)` shows as `1,234.56`.
+impl fmt::Display for Cents {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let abs = self.0.unsigned_abs();
+        let whole = (abs / 100).to_string();
+        let mut grouped = String::new();
+        for (i, digit) in whole.chars().enumerate() {
+            if i > 0 && (whole.len() - i).is_multiple_of(3) {
+                grouped.push(',');
+            }
+            grouped.push(digit);
+        }
+        write!(f, "{sign}{grouped}.{:02}", abs % 100)
+    }
+}
+
+// ---------- Users and permissions ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    Owner,
+    Manager,
+    Pharmacist,
+    #[default]
+    Cashier,
+}
+
+/// Everything that needs permission. Each button asks `role.can(action)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Sell,
+    SellPrescription,
+    VoidSale,
+    ReceiveStock,
+    AdjustStock,
+    EditProducts,
+    ViewReports,
+    ManageUsers,
+}
+
+impl Role {
+    pub const ALL: [Role; 4] = [Role::Owner, Role::Manager, Role::Pharmacist, Role::Cashier];
+
+    /// The whole permission table.
+    pub fn can(self, action: Action) -> bool {
+        use Action::*;
+        match self {
+            Role::Owner => true,
+            Role::Manager => action != ManageUsers,
+            Role::Pharmacist => matches!(action, Sell | SellPrescription | ReceiveStock),
+            Role::Cashier => action == Sell,
+        }
+    }
+
+    /// The code stored in the database (never shown to users).
+    pub fn code(self) -> &'static str {
+        match self {
+            Role::Owner => "owner",
+            Role::Manager => "manager",
+            Role::Pharmacist => "pharmacist",
+            Role::Cashier => "cashier",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Role {
+        Role::ALL.into_iter().find(|r| r.code() == code).unwrap_or(Role::Cashier) // least privilege if the value is unknown
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Owner => "Owner",
+            Role::Manager => "Branch manager",
+            Role::Pharmacist => "Pharmacist",
+            Role::Cashier => "Cashier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct User {
+    pub id: String,
+    pub name: String,
+    pub role: Role,
+    pub active: bool,
+}
+
+/// Who is logged in, and at which branch. Every change to the database is
+/// made "by" a session, so the audit log always knows who did it.
 #[derive(Debug, Clone)]
+pub struct Session {
+    pub user: User,
+    pub branch_id: String,
+}
+
+impl Session {
+    pub fn can(&self, action: Action) -> bool {
+        self.user.role.can(action)
+    }
+}
+
+// ---------- Catalogue ----------
+
+/// A medicine. Its stock isn't stored here: it's the sum of its batches,
+/// filled in when the list is loaded.
+#[derive(Debug, Clone, Default)]
 pub struct Product {
-    pub id: i64,
+    pub id: String,
+    /// Short code typed at the till, like a supermarket's (e.g. "1001").
+    pub code: String,
     pub name: String,
     pub category: String,
-    pub batch_number: String,
-    pub expiry_date: NaiveDate,
-    pub price: Cents,
-    pub cost_price: Cents,
-    pub stock_quantity: u32,
-    pub supplier_id: Option<i64>,
-    pub reorder_level: u32,
-    /// The code printed under the barcode on the box (e.g. "6162004002795"),
-    /// or `None` for products entered without one. An owned `String` rather
-    /// than a number: barcodes can start with 0 and some label formats mix
-    /// letters and digits, so they're identifiers, not quantities.
     pub barcode: Option<String>,
+    pub price: Cents,
+    pub reorder_level: i64,
+    pub prescription_only: bool,
+    /// Sellable units at this branch that are free to sell: not expired and
+    /// not held for an order waiting for payment.
+    pub stock: i64,
+    /// Units held for orders waiting for payment.
+    pub held: i64,
+    /// Expired units still on the shelf, waiting to be written off.
+    pub expired: i64,
+    /// Earliest expiry among the sellable batches.
+    pub next_expiry: Option<NaiveDate>,
+    /// Unit cost and quantity of the latest batch received (to pre-fill the next one).
+    pub last_cost: Option<Cents>,
+    pub last_qty: Option<i64>,
 }
 
 impl Product {
-    // These take `&self` — a borrow — because answering "is this low on
-    // stock?" doesn't need to consume the Product. The caller (an inventory
-    // list still rendering 200 other rows) keeps ownership the whole time.
-    pub fn is_low_stock(&self) -> bool {
-        self.stock_quantity <= self.reorder_level
+    /// Search by name, category, code or barcode (an empty query matches all).
+    pub fn matches(&self, query: &str) -> bool {
+        let q = query.trim().to_lowercase();
+        q.is_empty()
+            || self.name.to_lowercase().contains(&q)
+            || self.category.to_lowercase().contains(&q)
+            || self.code.to_lowercase().starts_with(&q)
+            || self.barcode.as_deref().is_some_and(|code| code.contains(&q))
     }
 
-    pub fn is_expired(&self, today: NaiveDate) -> bool {
-        self.expiry_date < today
+    /// True when `query` is exactly this medicine's barcode or code, the way
+    /// a scanner or a cashier keying a code would enter it.
+    pub fn is_exactly(&self, query: &str) -> bool {
+        let q = query.trim();
+        !q.is_empty() && (self.code.eq_ignore_ascii_case(q) || self.barcode.as_deref() == Some(q))
     }
 
-    pub fn is_expiring_soon(&self, today: NaiveDate, within_days: i64) -> bool {
-        let days_left = (self.expiry_date - today).num_days();
-        (0..=within_days).contains(&days_left)
+    /// "1001 · Panadol 500mg"
+    pub fn label(&self) -> String {
+        format!("{} · {}", self.code, self.name)
     }
-}
 
-/// One line in the active cart. Deliberately holds only `product_id` +
-/// `quantity` — NOT a cloned copy of the whole Product. If a cart item
-/// stored its own `name: String` and `price: Cents` snapshot, every add-
-/// to-cart click would heap-allocate a copy of the product's name, and a
-/// price change mid-shift wouldn't be reflected in items already in the
-/// cart. Because it's just two integers, `CartItem` is `Copy` — cheap to
-/// store in a `Vec` and cheap to duplicate if the user clicks "+1".
-#[derive(Debug, Clone, Copy)]
-pub struct CartItem {
-    pub product_id: i64,
-    pub quantity: u32,
-}
-
-impl CartItem {
-    /// Takes `product: &Product` — a borrow, not ownership. This function
-    /// only needs to read the price for one instant to compute a number;
-    /// there's no reason to move or clone the Product just to ask it a
-    /// question, and the borrow checker enforces that the Product this
-    /// points at is still valid (still in the inventory list) when called.
-    pub fn subtotal(&self, product: &Product) -> Cents {
-        product.price * self.quantity
+    pub fn expires_within(&self, today: NaiveDate, days: i64) -> bool {
+        self.next_expiry.is_some_and(|d| (d - today).num_days() <= days)
     }
 }
+
+/// One batch (lot) of a medicine at this branch, with its current stock.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    pub id: String,
+    pub product_id: String,
+    pub product_name: String,
+    pub batch_no: String,
+    pub expiry: NaiveDate,
+    pub cost: Cents,
+    pub qty: i64,
+}
+
+// ---------- Selling ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PaymentMethod {
+pub enum Payment {
     #[default]
     Cash,
-    Card,
-    MobileMoney,
+    Mpesa,
 }
 
-/// A completed sale — a historical record. Unlike CartItem, SaleItem DOES
-/// snapshot the product's name and price at sale time (see below), because
-/// a receipt from last month must stay correct even if that product is
-/// later renamed, repriced, or deleted. That's an intentional ownership
-/// choice, not an oversight: once a sale is final, it needs to own its own
-/// facts rather than borrow ones that can drift.
-#[derive(Debug, Clone)]
-pub struct Sale {
-    pub id: i64,
-    pub sale_date: NaiveDate,
-    pub items: Vec<SaleItem>,
-    pub payment_method: PaymentMethod,
-}
+impl Payment {
+    pub const ALL: [Payment; 2] = [Payment::Cash, Payment::Mpesa];
 
-impl Sale {
-    /// `.iter()` borrows each `SaleItem` in turn rather than draining or
-    /// cloning the Vec — the caller still owns `self.items` afterward.
-    pub fn total(&self) -> Cents {
-        self.items.iter().fold(Cents(0), |acc, item| acc + item.subtotal())
+    pub fn code(self) -> &'static str {
+        match self {
+            Payment::Cash => "cash",
+            Payment::Mpesa => "mpesa",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Payment::Cash => "Cash",
+            Payment::Mpesa => "M-Pesa",
+        }
     }
 }
 
+/// A cart line: which medicine and how many. Price, batch and cost are
+/// looked up when the sale is recorded, so they can't go stale.
 #[derive(Debug, Clone)]
-pub struct SaleItem {
-    pub product_id: i64,
-    pub product_name: String, // snapshot, deliberately owned — see Sale's doc comment
-    pub quantity: u32,
-    pub unit_price: Cents,
+pub struct CartLine {
+    pub product_id: String,
+    pub qty: i64,
 }
 
-impl SaleItem {
-    pub fn subtotal(&self) -> Cents {
-        self.unit_price * self.quantity
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Supplier {
-    pub id: i64,
+/// One seller's takings in a shift.
+#[derive(Debug, Clone, Default)]
+pub struct SellerTotals {
     pub name: String,
-    pub contact_phone: String,
-    pub contact_email: String,
-    pub address: String,
-    pub notes: String,
+    pub sales: i64,
+    pub cash: Cents,
+    pub mpesa: Cents,
 }
 
-/// A delivery received from a supplier — restocking inventory. Like Sale,
-/// this snapshots batch/expiry/cost per item rather than borrowing from
-/// Product, because a delivery record documents what physically arrived on
-/// that date and must stay accurate as a paper trail.
-#[derive(Debug, Clone)]
-pub struct Delivery {
-    pub id: i64,
-    pub supplier_id: i64,
-    pub delivery_date: NaiveDate,
-    pub invoice_number: String,
-    pub notes: String,
-    pub items: Vec<DeliveryItem>,
-}
-
-impl Delivery {
-    pub fn total_cost(&self) -> Cents {
-        self.items.iter().fold(Cents(0), |acc, item| acc + item.line_cost())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeliveryItem {
-    pub product_id: i64,
-    pub quantity: u32,
-    pub unit_cost: Cents,
-    pub batch_number: String,
-    pub expiry_date: NaiveDate,
-}
-
-impl DeliveryItem {
-    pub fn line_cost(&self) -> Cents {
-        self.unit_cost * self.quantity
-    }
-}
-
-// --- Sales & delivery history (read models) ---
-//
-// `SaleRecord`/`DeliveryRecord` exist only for the history screen. Unlike
-// `Sale`/`Delivery` (built once from live user input right before a write),
-// a `*Record` is built fresh from a database query every time the history
-// screen renders — the row data lived in a `rusqlite::Row` that's dropped as
-// soon as the query finishes, so owning every field isn't a style choice,
-// it's required for the data to outlive the query.
-
-/// One historical sale with its line items, for the history screen.
-pub struct SaleRecord {
-    pub id: i64,
-    pub sale_date: NaiveDate,
-    pub payment_method: String,
-    pub items: Vec<SaleItemRecord>,
-}
-
-impl SaleRecord {
-    /// Recomputed from line items rather than stored redundantly — the
-    /// line items stay the single source of truth for the total.
+impl SellerTotals {
     pub fn total(&self) -> Cents {
-        self.items
-            .iter()
-            .fold(Cents(0), |acc, item| acc + item.subtotal())
+        self.cash + self.mpesa
     }
 }
 
-/// One line of a historical sale. `product_name` is the snapshot taken at
-/// sale time, not a live lookup into `products` — history stays accurate
-/// even if the product is later renamed, repriced, or removed.
-pub struct SaleItemRecord {
+/// The till's shift. Everyone who logs in at this till sells into the open
+/// shift. `sellers` totals the sales each person made (served the customer);
+/// `cashiers` totals the money each person took at payment.
+#[derive(Debug, Clone)]
+pub struct Shift {
+    pub id: String,
+    pub opened_at: String,
+    pub opened_by: String,
+    pub sellers: Vec<SellerTotals>,
+    pub cashiers: Vec<SellerTotals>,
+    /// Orders still waiting for payment.
+    pub waiting: i64,
+}
+
+impl Shift {
+    /// Everyone together.
+    pub fn totals(&self) -> SellerTotals {
+        total_of(&self.sellers)
+    }
+}
+
+/// One "All" line adding up per-person totals.
+pub fn total_of(people: &[SellerTotals]) -> SellerTotals {
+    people.iter().fold(SellerTotals { name: "All".into(), ..Default::default() }, |t, s| SellerTotals {
+        sales: t.sales + s.sales,
+        cash: t.cash + s.cash,
+        mpesa: t.mpesa + s.mpesa,
+        ..t
+    })
+}
+
+/// An order a seller sent to the cashier, waiting for payment.
+#[derive(Debug, Clone)]
+pub struct Order {
+    pub id: String,
+    /// Today's order number at this branch (1, 2, 3, ...).
+    pub number: i64,
+    pub seller: String,
+    pub at: String,
+    pub lines: Vec<CartLine>,
+    pub total: Cents,
+}
+
+/// Everything printed on a receipt.
+#[derive(Debug, Clone)]
+pub struct Receipt {
+    pub number: String,
+    pub order: Option<i64>,
+    pub at: String,
+    pub seller: String,
+    pub cashier: String,
+    pub payment: String,
+    pub mpesa_code: Option<String>,
+    pub paid: Option<Cents>,
+    /// (medicine, quantity, unit price)
+    pub lines: Vec<(String, i64, Cents)>,
+    pub total: Cents,
+    pub void: bool,
+}
+
+// ---------- Receiving stock ----------
+
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryLine {
+    /// Set when these units top up a batch already on the shelf (same batch
+    /// number and expiry); `None` makes a new batch.
+    pub batch_id: Option<String>,
+    pub product_id: String,
     pub product_name: String,
-    pub quantity: u32,
-    pub unit_price: Cents,
+    pub batch_no: String,
+    pub expiry: NaiveDate,
+    pub qty: i64,
+    pub cost: Cents,
 }
 
-impl SaleItemRecord {
-    pub fn subtotal(&self) -> Cents {
-        self.unit_price * self.quantity
+#[derive(Debug, Clone, Default)]
+pub struct Delivery {
+    /// Optional invoice or note number, for finding it again later.
+    pub invoice_no: String,
+    pub lines: Vec<DeliveryLine>,
+}
+
+// ---------- Reports ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Report {
+    #[default]
+    SalesByDay,
+    Sales,
+    SalesByMedicine,
+    SalesByCashier,
+    SellersPerShift,
+    CollectedByCashier,
+    UnpaidOrders,
+    SalesByPayment,
+    StockOnHand,
+    Reorder,
+    Expiry,
+    Deliveries,
+    Shifts,
+    Audit,
+}
+
+impl Report {
+    pub const ALL: [Report; 14] = [
+        Report::SalesByDay,
+        Report::Sales,
+        Report::SalesByMedicine,
+        Report::SalesByCashier,
+        Report::SellersPerShift,
+        Report::CollectedByCashier,
+        Report::UnpaidOrders,
+        Report::SalesByPayment,
+        Report::StockOnHand,
+        Report::Reorder,
+        Report::Expiry,
+        Report::Deliveries,
+        Report::Shifts,
+        Report::Audit,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Report::SalesByDay => "Sales & profit by day",
+            Report::Sales => "Sales (receipts)",
+            Report::SalesByMedicine => "Sales by medicine",
+            Report::SalesByCashier => "Sales by seller",
+            Report::SellersPerShift => "Sellers in each shift",
+            Report::CollectedByCashier => "Money taken by cashier",
+            Report::UnpaidOrders => "Orders not paid",
+            Report::SalesByPayment => "Sales by payment",
+            Report::StockOnHand => "Stock on hand",
+            Report::Reorder => "Reorder list (below 50)",
+            Report::Expiry => "Expiring in 90 days",
+            Report::Deliveries => "Stock checked in",
+            Report::Shifts => "Shifts (Z reports)",
+            Report::Audit => "Audit log",
+        }
+    }
+
+    /// Stock reports show the present moment; the rest use the date range.
+    pub fn uses_dates(self) -> bool {
+        !matches!(self, Report::StockOnHand | Report::Reorder | Report::Expiry)
     }
 }
 
-/// One historical delivery with its line items, for the history screen.
-pub struct DeliveryRecord {
-    pub id: i64,
-    pub supplier_id: i64,
-    pub supplier_name: String,
-    pub delivery_date: NaiveDate,
-    pub invoice_number: String,
-    pub notes: String,
-    pub items: Vec<DeliveryItemRecord>,
+/// Any report, ready to show or export. `keys[i]` identifies row `i`
+/// (e.g. the sale id behind a receipt row) and is never displayed.
+#[derive(Debug, Clone, Default)]
+pub struct Table {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub keys: Vec<String>,
 }
 
-impl DeliveryRecord {
-    pub fn total_cost(&self) -> Cents {
-        self.items
-            .iter()
-            .fold(Cents(0), |acc, item| acc + item.line_cost())
-    }
-}
-
-/// One line of a historical delivery.
-pub struct DeliveryItemRecord {
-    pub product_id: i64,
-    pub product_name: String,
-    pub quantity: u32,
-    pub unit_cost: Cents,
-    pub batch_number: String,
-    pub expiry_date: NaiveDate,
-}
-
-impl DeliveryItemRecord {
-    pub fn line_cost(&self) -> Cents {
-        self.unit_cost * self.quantity
-    }
+/// The numbers at the top of the Reports screen.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub today_sales: Cents,
+    pub today_profit: Cents,
+    pub low_stock: i64,
+    pub expiring_soon: i64,
+    pub expired_value: Cents,
 }

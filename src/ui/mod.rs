@@ -1,8 +1,7 @@
+pub mod admin;
 pub mod pos;
-pub mod inventory;
-pub mod suppliers;
-pub mod notify;
-pub mod history;
-pub mod dashboard;
-pub mod theme;
+pub mod products;
+pub mod reports;
 pub mod scan;
+pub mod stock;
+pub mod theme;
