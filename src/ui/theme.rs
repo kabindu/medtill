@@ -21,7 +21,7 @@ pub const STRIPE_BG: egui::Color32 = egui::Color32::from_rgb(0xf1, 0xf5, 0xfb);
 
 // Status colours are only for alerts, and always sit next to a text label.
 pub const STATUS_GOOD: egui::Color32 = egui::Color32::from_rgb(0x0c, 0xa3, 0x0c);
-pub const STATUS_SERIOUS: egui::Color32 = egui::Color32::from_rgb(0xec, 0x83, 0x5a);
+pub const STATUS_SERIOUS: egui::Color32 = egui::Color32::from_rgb(0xe6, 0x77, 0x00);
 pub const STATUS_CRITICAL: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x3b, 0x3b);
 
 /// Use Windows' own UI font (Segoe UI); keep egui's font if it can't be read.
@@ -300,14 +300,13 @@ fn button(ui: &mut egui::Ui, look: Look, text: impl Into<String>) -> egui::Respo
         Look::Quiet => ([C::TRANSPARENT, ACCENT_WASH], [C::TRANSPARENT, ACCENT_WASH], ACCENT_STRONG),
     };
     let text = egui::RichText::new(text).color(ink);
-    let main = look != Look::Quiet;
-    ui.scope(|ui| {
-        if main {
-            ui.spacing_mut().button_padding.x += 6.0;
-        }
-        styled_button(ui, fills, borders, if main { text.strong() } else { text }, 8)
-    })
-    .inner
+    let (main, s) = (look != Look::Quiet, ui.spacing());
+    let shape = Shape {
+        radius: 8,
+        padding: s.button_padding + egui::vec2(if main { 6.0 } else { 0.0 }, 0.0),
+        height: s.interact_size.y,
+    };
+    styled_button(ui, fills, borders, if main { text.strong() } else { text }, shape)
 }
 
 /// A blue main action ("Save", "Complete sale").
@@ -337,19 +336,67 @@ pub fn big_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .inner
 }
 
-/// A rounded pill for choosing one of several (screens, report kinds, the
-/// payment type) or for one-tap picks; filled blue when selected.
+/// A rounded pill for choosing one of several (login names, the payment
+/// type, a date range) or for one-tap picks; filled blue when selected.
+/// Its text never wraps, and long names are cut to 24 characters.
 pub fn chip(ui: &mut egui::Ui, text: impl Into<String>, selected: bool) -> egui::Response {
     let (fills, ink) = match selected {
         true => ([ACCENT, ACCENT_STRONG], egui::Color32::WHITE),
         false => ([ACCENT_WASH, ACCENT_PRESSED], ACCENT_STRONG),
     };
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(14.0, 4.0);
-        ui.spacing_mut().interact_size.y = 30.0;
-        styled_button(ui, fills, fills, egui::RichText::new(text).color(ink), 15)
-    })
-    .inner
+    pill(ui, text.into(), fills, ink)
+}
+
+fn pill(ui: &mut egui::Ui, mut text: String, fills: [egui::Color32; 2], ink: egui::Color32) -> egui::Response {
+    if let Some((cut, _)) = text.char_indices().nth(24) {
+        text = format!("{}…", &text[..cut]);
+    }
+    let shape = Shape { radius: 15, padding: egui::vec2(14.0, 4.0), height: 30.0 };
+    styled_button(ui, fills, fills, egui::RichText::new(text).color(ink), shape)
+}
+
+/// A small status pill: a coloured dot and a word or two on a pale tint of
+/// the same colour ("● Main · 2 online"). Not a button; hover for details.
+pub fn status_badge(ui: &mut egui::Ui, colour: egui::Color32, text: &str) -> egui::Response {
+    egui::Frame::NONE
+        .fill(colour.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, colour.gamma_multiply(0.45)))
+        .corner_radius(12)
+        .inner_margin(egui::Margin { left: 10, right: 12, top: 3, bottom: 3 })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(12.0).color(colour));
+                ui.label(egui::RichText::new(text).size(14.0).strong().color(colour));
+            });
+        })
+        .response
+        .interact(egui::Sense::hover())
+}
+
+/// A small label over a wrapping row of pick chips ("Popular": Panadol,
+/// Amoxil, ...). `items` are (name, can be picked); returns the one clicked.
+/// One that can't be picked (out of stock) is grey.
+pub fn chip_row(ui: &mut egui::Ui, label: &str, items: &[(&str, bool)]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    ui.label(egui::RichText::new(label).size(14.0).color(TEXT_SECONDARY));
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+        for (i, &(name, enabled)) in items.iter().enumerate() {
+            let chip = match enabled {
+                true => chip(ui, name, false),
+                false => pill(ui, name.to_string(), [GRIDLINE, GRIDLINE], TEXT_SECONDARY),
+            };
+            if chip.on_hover_text(name).clicked() && enabled {
+                clicked = Some(i);
+            }
+        }
+    });
+    ui.add_space(4.0);
+    clicked
 }
 
 /// A menu entry (the screens, the report list): plain text that is filled
@@ -359,11 +406,8 @@ pub fn tab(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
         true => ([ACCENT, ACCENT_STRONG], egui::Color32::WHITE),
         false => ([egui::Color32::TRANSPARENT, ACCENT_WASH], TEXT_PRIMARY),
     };
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(14.0, 6.0);
-        styled_button(ui, fills, fills, egui::RichText::new(text).color(ink), 8)
-    })
-    .inner
+    let shape = Shape { radius: 8, padding: egui::vec2(14.0, 6.0), height: ui.spacing().interact_size.y };
+    styled_button(ui, fills, fills, egui::RichText::new(text).color(ink), shape)
 }
 
 /// A row of buttons under a form: the main action first, "Cancel" last.
@@ -376,22 +420,38 @@ pub fn actions<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
     .inner
 }
 
-/// Draws a button with these colours; the changes stay inside the caller's scope.
+/// A button's corner radius, padding and height.
+struct Shape {
+    radius: u8,
+    padding: egui::Vec2,
+    height: f32,
+}
+
+/// Draws a button with these colours. The style is changed on this same
+/// `ui` and put back afterwards, not in a child scope: egui never moves a
+/// child scope onto the next line, so pills in a wrapping row would not wrap.
 fn styled_button(
     ui: &mut egui::Ui,
     fills: [egui::Color32; 2],
     borders: [egui::Color32; 2],
     text: egui::RichText,
-    radius: u8,
+    shape: Shape,
 ) -> egui::Response {
-    let w = &mut ui.visuals_mut().widgets;
+    let saved = ui.style().clone();
+    let style = ui.style_mut();
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
+    style.spacing.button_padding = shape.padding;
+    style.spacing.interact_size.y = shape.height;
+    let w = &mut style.visuals.widgets;
     for (state, i) in [(&mut w.inactive, 0), (&mut w.hovered, 1), (&mut w.active, 1)] {
         state.weak_bg_fill = fills[i];
         state.bg_stroke = egui::Stroke::new(1.0, borders[i]);
-        state.corner_radius = egui::CornerRadius::from(radius);
+        state.corner_radius = egui::CornerRadius::from(shape.radius);
         state.expansion = 0.0;
     }
-    ui.add(egui::Button::new(text))
+    let response = ui.add(egui::Button::new(text));
+    ui.set_style(saved);
+    response
 }
 
 // ---------- Lists ----------
@@ -455,8 +515,12 @@ pub fn long_list(
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
         ui.horizontal(|ui| {
             for (header, &w) in headers.iter().zip(&widths) {
-                cell(ui, w, 24.0, |ui| {
-                    ui.label(egui::RichText::new(*header).strong().color(TEXT_SECONDARY));
+                // A header starting with '>' is right-aligned, over a column of numbers.
+                let (right, header) = header.strip_prefix('>').map_or((false, *header), |h| (true, h));
+                let text = egui::RichText::new(header).strong().size(14.0).color(TEXT_SECONDARY);
+                cell(ui, w, 24.0, |ui| match right {
+                    true => number_cell(ui, text),
+                    false => cell_text(ui, text),
                 });
             }
         });
@@ -497,48 +561,87 @@ pub fn cell_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).truncate());
 }
 
-/// A stock alert by units left: under 10 red, under 25 orange, under 50 green.
-pub fn stock_alert(units: i64) -> Option<(egui::Color32, &'static str)> {
+/// How much stock is left: red below 10, orange below 50, green from 50.
+pub fn stock_status(units: i64) -> (egui::Color32, &'static str) {
     match units {
-        ..10 => Some((STATUS_CRITICAL, "● Below 10 — reorder now")),
-        10..25 => Some((STATUS_SERIOUS, "● Below 25")),
-        25..50 => Some((STATUS_GOOD, "● Below 50")),
-        _ => None,
+        ..10 => (STATUS_CRITICAL, "Low — reorder"),
+        10..50 => (STATUS_SERIOUS, "Running low"),
+        _ => (STATUS_GOOD, "Good"),
     }
 }
 
+/// The coloured stock dot on its own.
+pub fn stock_dot(ui: &mut egui::Ui, units: i64) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.5, stock_status(units).0);
+}
+
+/// The coloured stock dot and its word ("● Running low").
+pub fn stock_level(ui: &mut egui::Ui, units: i64) {
+    stock_dot(ui, units);
+    let (colour, word) = stock_status(units);
+    ui.label(egui::RichText::new(word).color(colour).strong());
+}
+
 /// A number, right-aligned so columns of figures line up.
-pub fn number_cell(ui: &mut egui::Ui, text: impl Into<String>) {
+pub fn number_cell(ui: &mut egui::Ui, text: impl Into<egui::RichText>) {
     let text = text.into();
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.label(text);
     });
 }
 
-/// Any report table. `action` adds one widget per row in a last column
-/// (e.g. a "Void" button) — add an empty label when there's nothing to add.
-pub fn report_table(ui: &mut egui::Ui, id: &str, table: &Table, mut action: impl FnMut(&mut egui::Ui, usize)) {
-    const SHOWN: usize = 500;
-    let mut headers: Vec<&str> = table.headers.iter().map(String::as_str).collect();
-    headers.push("");
-    list(ui, id, &headers, |ui| {
-        for (i, row) in table.rows.iter().take(SHOWN).enumerate() {
-            for cell in row {
-                if cell.replace(',', "").parse::<f64>().is_ok() {
-                    number_cell(ui, cell.as_str());
-                } else {
-                    ui.label(cell);
-                }
-            }
-            action(ui, i);
-            ui.end_row();
+/// Any report as a smooth long list. Number columns are right-aligned, the
+/// widest text column takes the spare width, and `action` (when
+/// `action_width` > 0) adds buttons at the end of each row.
+pub fn report_table(
+    ui: &mut egui::Ui,
+    id: &str,
+    table: &Table,
+    action_width: f32,
+    mut action: impl FnMut(&mut egui::Ui, usize),
+) {
+    if table.rows.is_empty() {
+        return panel(ui, |ui| muted(ui, "Nothing to show for these dates."));
+    }
+    let cols = table.headers.len();
+    let is_number = |text: &str| text.is_empty() || text.replace(',', "").parse::<f64>().is_ok();
+    let numeric: Vec<bool> = (0..cols).map(|c| table.rows.iter().all(|r| is_number(&r[c]))).collect();
+    // About 8 px a character; the first 300 rows are enough to size a column.
+    let mut widths: Vec<f32> = (0..cols)
+        .map(|c| {
+            let longest = table.rows.iter().take(300).map(|r| r[c].chars().count()).max().unwrap_or(0);
+            (longest.max(table.headers[c].chars().count()) as f32 * 8.0 + 20.0).clamp(64.0, 280.0)
+        })
+        .collect();
+    let flex = (0..cols).filter(|&c| !numeric[c]).max_by(|&a, &b| widths[a].total_cmp(&widths[b]));
+    if let Some(c) = flex {
+        widths[c] = 0.0;
+    }
+    let mut headers: Vec<String> =
+        table.headers.iter().zip(&numeric).map(|(h, &n)| if n { format!(">{h}") } else { h.clone() }).collect();
+    if action_width > 0.0 {
+        headers.push(String::new());
+        widths.push(action_width);
+    }
+    // Narrow window: shrink the fixed columns so the row still fits.
+    let room = ui.available_width() - 40.0 - 8.0 * widths.len() as f32 - 160.0;
+    let fixed: f32 = widths.iter().sum();
+    if fixed > room {
+        widths.iter_mut().for_each(|w| *w = if *w == 0.0 { 0.0 } else { (*w * room / fixed).max(48.0) });
+    }
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    long_list(ui, id, &headers, &widths, table.rows.len(), |ui, i, w| {
+        for (c, text) in table.rows[i].iter().enumerate() {
+            cell(ui, w[c], ROW_HEIGHT, |ui| match numeric[c] {
+                true => number_cell(ui, text.as_str()),
+                false => cell_text(ui, text.as_str()),
+            });
+        }
+        if action_width > 0.0 {
+            cell(ui, w[cols], ROW_HEIGHT, |ui| action(ui, i));
         }
     });
-    if table.rows.is_empty() {
-        muted(ui, "Nothing to show for these dates.");
-    } else if table.rows.len() > SHOWN {
-        muted(ui, format!("Showing {SHOWN} of {} rows — export to CSV to see them all.", table.rows.len()));
-    }
 }
 
 /// What was clicked in a row's "Edit / Delete" buttons.
@@ -576,18 +679,27 @@ pub fn edit_delete(ui: &mut egui::Ui, row_id: &str, confirming: &mut Option<Stri
     click
 }
 
-/// A big number over a label.
-pub fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, colour: egui::Color32) {
-    egui::Frame::NONE
-        .fill(PANEL_BG)
-        .corner_radius(egui::CornerRadius::from(10))
-        .stroke(egui::Stroke::new(1.0, GRIDLINE))
-        .inner_margin(egui::Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_min_width(200.0);
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new(value).size(30.0).strong().color(colour));
-                ui.label(egui::RichText::new(label).size(15.0).color(TEXT_SECONDARY));
-            });
-        });
+/// A row of equal-width number cards that fills the width: a label over
+/// a big figure, with a coloured edge.
+pub fn stat_row(ui: &mut egui::Ui, tiles: &[(&str, String, egui::Color32)]) {
+    let gap = 12.0;
+    let width = ((ui.available_width() - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32).max(140.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (label, value, colour) in tiles {
+            let card = egui::Frame::NONE
+                .fill(PANEL_BG)
+                .corner_radius(egui::CornerRadius::from(10))
+                .stroke(egui::Stroke::new(1.0, GRIDLINE))
+                .inner_margin(egui::Margin { left: 20, right: 16, top: 12, bottom: 12 })
+                .show(ui, |ui| {
+                    ui.set_width(width - 38.0);
+                    ui.label(egui::RichText::new(*label).size(14.0).color(TEXT_SECONDARY));
+                    ui.label(egui::RichText::new(value).size(28.0).strong().color(*colour));
+                });
+            let edge = egui::Rect::from_min_size(card.response.rect.min, egui::vec2(5.0, card.response.rect.height()));
+            let round = egui::CornerRadius { nw: 10, sw: 10, ne: 0, se: 0 };
+            ui.painter().rect_filled(edge, round, *colour);
+        }
+    });
 }

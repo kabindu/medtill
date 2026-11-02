@@ -352,6 +352,7 @@ pub enum Report {
     SalesByPayment,
     StockOnHand,
     Reorder,
+    ExpiryRisk,
     Expiry,
     Deliveries,
     Shifts,
@@ -359,23 +360,6 @@ pub enum Report {
 }
 
 impl Report {
-    pub const ALL: [Report; 14] = [
-        Report::SalesByDay,
-        Report::Sales,
-        Report::SalesByMedicine,
-        Report::SalesByCashier,
-        Report::SellersPerShift,
-        Report::CollectedByCashier,
-        Report::UnpaidOrders,
-        Report::SalesByPayment,
-        Report::StockOnHand,
-        Report::Reorder,
-        Report::Expiry,
-        Report::Deliveries,
-        Report::Shifts,
-        Report::Audit,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Report::SalesByDay => "Sales & profit by day",
@@ -387,7 +371,8 @@ impl Report {
             Report::UnpaidOrders => "Orders not paid",
             Report::SalesByPayment => "Sales by payment",
             Report::StockOnHand => "Stock on hand",
-            Report::Reorder => "Reorder list (below 50)",
+            Report::Reorder => "Reorder suggestions",
+            Report::ExpiryRisk => "Expiry risk (won't sell in time)",
             Report::Expiry => "Expiring in 90 days",
             Report::Deliveries => "Stock checked in",
             Report::Shifts => "Shifts (Z reports)",
@@ -397,7 +382,7 @@ impl Report {
 
     /// Stock reports show the present moment; the rest use the date range.
     pub fn uses_dates(self) -> bool {
-        !matches!(self, Report::StockOnHand | Report::Reorder | Report::Expiry)
+        !matches!(self, Report::StockOnHand | Report::Reorder | Report::ExpiryRisk | Report::Expiry)
     }
 }
 

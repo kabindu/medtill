@@ -119,7 +119,8 @@ pub fn parse_mpesa_code(raw: &str) -> Result<Option<String>, String> {
 /// A date as YYYY-MM-DD (report ranges).
 pub fn parse_date(label: &str, raw: &str) -> Result<NaiveDate, String> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
-        .map_err(|_| format!("{label} must be a date like 2026-10-01 (YYYY-MM-DD)."))
+        .or_else(|_| NaiveDate::parse_from_str(raw.trim(), "%d/%m/%Y"))
+        .map_err(|_| format!("{label} must be a date like 2026-10-01 or 01/10/2026."))
 }
 
 /// 4 to 8 digits.
@@ -131,50 +132,9 @@ pub fn parse_pin(raw: &str) -> Result<String, String> {
     Ok(pin.to_string())
 }
 
-/// Optional (`None` when empty). Standard retail codes (EAN-8, UPC-A,
-/// EAN-13, GTIN-14) must pass their check digit, so a misread digit is
-/// caught here. Shop-printed codes need 3–40 letters, digits or dashes.
-pub fn parse_barcode(raw: &str) -> Result<Option<String>, String> {
-    let code = raw.trim();
-    if code.is_empty() {
-        return Ok(None);
-    }
-    if code.chars().all(|c| c.is_ascii_digit()) && matches!(code.len(), 8 | 12 | 13 | 14) {
-        if !gtin_check_digit_ok(code) {
-            return Err(format!("Barcode {code} has a wrong check digit — scan it again."));
-        }
-        return Ok(Some(code.to_string()));
-    }
-    let valid = (3..=40).contains(&code.len()) && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    if !valid {
-        return Err("Barcode should be 3–40 letters or digits.".to_string());
-    }
-    Ok(Some(code.to_string()))
-}
-
-/// From the right (without the check digit), weights 3, 1, 3, 1, ...; the
-/// check digit brings the sum up to a multiple of 10.
-fn gtin_check_digit_ok(code: &str) -> bool {
-    let digits: Vec<u32> = code.bytes().map(|b| u32::from(b - b'0')).collect();
-    let Some((check, body)) = digits.split_last() else {
-        return false;
-    };
-    let sum: u32 = body.iter().rev().enumerate().map(|(i, d)| if i % 2 == 0 { d * 3 } else { *d }).sum();
-    (10 - sum % 10) % 10 == *check
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn barcodes() {
-        assert_eq!(parse_barcode(" 6162004002795 "), Ok(Some("6162004002795".into())));
-        assert!(parse_barcode("6162004002796").is_err());
-        assert_eq!(parse_barcode(""), Ok(None));
-        assert_eq!(parse_barcode("MT-000123"), Ok(Some("MT-000123".into())));
-        assert!(parse_barcode("a b").is_err());
-    }
 
     #[test]
     fn money() {

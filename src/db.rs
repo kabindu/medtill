@@ -49,7 +49,7 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
 
 // ---------- Schema ----------
 
-const VERSION: i32 = 4;
+pub const VERSION: i32 = 7;
 
 /// `{id}` and `{now}` are expanded before running (see `migrate`).
 const SCHEMA: &str = "
@@ -187,6 +187,32 @@ UPDATE sales SET cashier_id = user_id, paid_at = at;
 CREATE INDEX sales_status ON sales(branch_id, status);
 ";
 
+/// Version 5: staff can be deleted (hidden; their name stays on old sales).
+const V5: &str = "ALTER TABLE users ADD COLUMN deleted_at TEXT;";
+
+/// Version 6: words read off each medicine's box, so the camera recognises
+/// boxes it has seen before.
+const V6: &str = "CREATE TABLE box_words (product_id TEXT NOT NULL, word TEXT NOT NULL,
+    PRIMARY KEY (product_id, word)) WITHOUT ROWID;";
+
+/// Version 7: several computers, each a full till (see `sync`). Every
+/// computer has a till number; shifts and sales remember theirs. Each
+/// change to a shared table is noted in `sync_log` (by triggers, added in
+/// `migrate`) so it can be sent to the other computers; `sync_state` holds
+/// this computer's own settings and is never shared.
+const V7: &str = "
+ALTER TABLE shifts ADD COLUMN till INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE sales ADD COLUMN till INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE sync_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+INSERT INTO sync_state (k, v) VALUES ('till', '1'), ('mute', '0'), ('role', ''), ('sent', '0'), ('cursor', '0');
+CREATE TABLE sync_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, key TEXT NOT NULL,
+    gone INTEGER NOT NULL DEFAULT 0, origin INTEGER);
+CREATE INDEX sync_log_row ON sync_log(tbl, key);
+";
+
+/// This computer's till number (1 unless it joined another computer).
+const TILL: &str = "(SELECT CAST(v AS INTEGER) FROM sync_state WHERE k = 'till')";
+
 /// Opens (or creates) the database and brings it up to date.
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -223,13 +249,27 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 3 {
         tx.execute_batch(V3)?;
     }
-    tx.execute_batch(V4)?;
+    if version < 4 {
+        tx.execute_batch(V4)?;
+    }
+    if version < 5 {
+        tx.execute_batch(V5)?;
+    }
+    if version < 6 {
+        tx.execute_batch(V6)?;
+    }
+    if version < 7 {
+        tx.execute_batch(V7)?;
+        tx.execute_batch(&crate::sync::log_triggers())?;
+        tx.execute_batch(&crate::sync::log_everything())?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
 }
 
-fn audit(conn: &Connection, s: &Session, action: &str, detail: &str) -> Result<()> {
+/// Writes a line to the audit log (who did what, when).
+pub fn audit(conn: &Connection, s: &Session, action: &str, detail: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO audit (branch_id, user_id, action, detail) VALUES (?1, ?2, ?3, ?4)",
         params![s.branch_id, s.user.id, action, detail],
@@ -275,6 +315,13 @@ pub fn rename_branch(conn: &Connection, s: &Session, name: &str) -> Result<()> {
 /// A setting such as "receipt_footer" (empty if never set).
 pub fn setting(conn: &Connection, key: &str) -> Result<String> {
     Ok(conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?.unwrap_or_default())
+}
+
+/// Stores a setting the app keeps for itself (such as the scan reader's
+/// learned weights): no audit entry, because no person changed it.
+pub fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", [key, value])?;
+    Ok(())
 }
 
 pub fn save_settings(conn: &Connection, s: &Session, pairs: &[(&str, &str)]) -> Result<()> {
@@ -326,7 +373,7 @@ pub fn list_users(conn: &Connection, all: bool) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, role, is_active FROM users
          WHERE (branch_id IS NULL OR branch_id = (SELECT value FROM settings WHERE key = 'branch_id'))
-           AND (?1 OR is_active = 1)
+           AND deleted_at IS NULL AND (?1 OR is_active = 1)
          ORDER BY is_active DESC, name COLLATE NOCASE",
     )?;
     let users = stmt.query_map([all], |r| {
@@ -338,9 +385,11 @@ pub fn list_users(conn: &Connection, all: bool) -> Result<Vec<User>> {
 /// `Ok(None)` when the PIN is wrong.
 pub fn login(conn: &Connection, user_id: &str, pin: &str) -> Result<Option<Session>> {
     let found = conn
-        .query_row("SELECT name, role, pin_hash FROM users WHERE id = ?1 AND is_active = 1", [user_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        })
+        .query_row(
+            "SELECT name, role, pin_hash FROM users WHERE id = ?1 AND is_active = 1 AND deleted_at IS NULL",
+            [user_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )
         .optional()?;
     let Some((name, role, stored)) = found else { return Ok(None) };
     if !pin_matches(pin, &stored) {
@@ -354,6 +403,9 @@ pub fn login(conn: &Connection, user_id: &str, pin: &str) -> Result<Option<Sessi
 
 /// Adds (empty `user.id`) or updates a user. `pin`: `None` keeps the old one.
 pub fn save_user(conn: &Connection, s: &Session, user: &User, pin: Option<&str>) -> Result<()> {
+    if user.id == s.user.id && (!user.active || user.role != Role::Owner) {
+        return fail("You can't block yourself or take away your own owner role.");
+    }
     let tx = conn.unchecked_transaction()?;
     let pin_hash = pin.map(hash_pin).transpose()?;
     let branch = (user.role != Role::Owner).then_some(&s.branch_id);
@@ -370,15 +422,37 @@ pub fn save_user(conn: &Connection, s: &Session, user: &User, pin: Option<&str>)
             params![user.name, user.role.code(), branch, user.active, pin_hash, user.id],
         )?;
     }
-    let owners: i64 =
-        tx.query_row("SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1", [], |r| r.get(0))?;
-    if owners == 0 {
-        return fail("There must always be at least one active owner.");
-    }
+    check_owner_left(&tx)?;
     let state = if user.active { "active" } else { "deactivated" };
     let pin_note = if pin.is_some() { ", PIN set" } else { "" };
     audit(&tx, s, "user", &format!("{} — {} ({state}{pin_note})", user.name, user.role.label()))?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a staff member: they can't log in and leave the staff list, but
+/// their name stays on the sales they made.
+pub fn delete_user(conn: &Connection, s: &Session, user: &User) -> Result<()> {
+    if user.id == s.user.id {
+        return fail("You can't delete yourself.");
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE users SET is_active = 0, deleted_at = datetime('now', 'localtime') WHERE id = ?1", [&user.id])?;
+    check_owner_left(&tx)?;
+    audit(&tx, s, "user", &format!("Deleted {} ({})", user.name, user.role.label()))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn check_owner_left(conn: &Connection) -> Result<()> {
+    let owners: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1 AND deleted_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if owners == 0 {
+        return fail("There must always be at least one active owner.");
+    }
     Ok(())
 }
 
@@ -493,8 +567,9 @@ pub fn recent_check_ins(conn: &Connection, branch: &str, limit: i64) -> Result<V
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Quick picks for the till: the medicines sold most in the last 30 days,
-/// and the ones sold most recently (ids, best first).
+/// Quick picks: the medicines bought most *often* in the last 30 days (on
+/// the most receipts, so one big order doesn't make a medicine "popular"),
+/// and the ones sold most recently. One indexed query each (sales by date).
 pub fn quick_picks(conn: &Connection, branch: &str, limit: i64) -> Result<(Vec<String>, Vec<String>)> {
     let ids = |order: &str| -> Result<Vec<String>> {
         let sql = format!(
@@ -506,7 +581,26 @@ pub fn quick_picks(conn: &Connection, branch: &str, limit: i64) -> Result<(Vec<S
         let rows = stmt.query_map(params![branch, limit], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     };
-    Ok((ids("SUM(si.qty)")?, ids("MAX(sa.at)")?))
+    Ok((ids("COUNT(DISTINCT sa.id) DESC, SUM(si.qty)")?, ids("MAX(sa.at)")?))
+}
+
+/// Remembers the words read off a medicine's box (once the user confirmed
+/// which medicine it was), so the next scan of that box finds it.
+pub fn learn_box_words(conn: &Connection, product_id: &str, words: &[String]) -> Result<()> {
+    let mut stmt = conn.prepare("INSERT OR IGNORE INTO box_words (product_id, word) VALUES (?1, ?2)")?;
+    for word in words.iter().take(30) {
+        stmt.execute([product_id, word])?;
+    }
+    Ok(())
+}
+
+/// Every (medicine id, word) learned from scans, for active medicines.
+pub fn box_words(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.product_id, w.word FROM box_words w JOIN products p ON p.id = w.product_id WHERE p.is_active = 1",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Hides a medicine. Its rows stay, because past sales point at them.
@@ -618,10 +712,13 @@ pub fn count_stock(conn: &Connection, s: &Session, b: &Batch, counted: i64) -> R
 pub fn current_shift(conn: &Connection, branch: &str) -> Result<Option<Shift>> {
     let head = conn
         .query_row(
-            "SELECT sh.id, sh.opened_at, COALESCE(u.name, ''),
-                    (SELECT COUNT(*) FROM sales o WHERE o.shift_id = sh.id AND o.status = 'open')
-             FROM shifts sh LEFT JOIN users u ON u.id = sh.user_id
-             WHERE sh.branch_id = ?1 AND sh.closed_at IS NULL ORDER BY sh.opened_at DESC LIMIT 1",
+            &format!(
+                "SELECT sh.id, sh.opened_at, COALESCE(u.name, ''),
+                        (SELECT COUNT(*) FROM sales o WHERE o.shift_id = sh.id AND o.status = 'open')
+                 FROM shifts sh LEFT JOIN users u ON u.id = sh.user_id
+                 WHERE sh.branch_id = ?1 AND sh.till = {TILL} AND sh.closed_at IS NULL
+                 ORDER BY sh.opened_at DESC LIMIT 1"
+            ),
             [branch],
             |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -652,7 +749,7 @@ pub fn open_shift(conn: &Connection, s: &Session) -> Result<()> {
         return fail("A shift is already open at this till.");
     }
     conn.execute(
-        "INSERT INTO shifts (branch_id, user_id, float_cents) VALUES (?1, ?2, 0)",
+        &format!("INSERT INTO shifts (branch_id, user_id, float_cents, till) VALUES (?1, ?2, 0, {TILL})"),
         params![s.branch_id, s.user.id],
     )?;
     audit(conn, s, "shift", "Opened the shift")
@@ -725,7 +822,8 @@ fn check_line(
 
 /// Sends a cart to the cashier as an order: the stock is held (not yet
 /// taken off the shelf) until the order is paid or cancelled.
-/// Returns today's order number.
+/// Returns today's order number: 1, 2, 3... at till 1, 1001, 1002... at
+/// till 2, and so on, so orders from different tills never share a number.
 pub fn place_order(conn: &Connection, s: &Session, lines: &[CartLine]) -> Result<i64> {
     let Some(shift) = current_shift(conn, &s.branch_id)? else { return fail("Open the shift first.") };
     if lines.is_empty() {
@@ -733,9 +831,12 @@ pub fn place_order(conn: &Connection, s: &Session, lines: &[CartLine]) -> Result
     }
     let tx = conn.unchecked_transaction()?;
     let (id, number): (String, i64) = tx.query_row(
-        "INSERT INTO sales (branch_id, shift_id, user_id, payment, status, order_no)
-         VALUES (?1, ?2, ?3, '', 'open', (SELECT COALESCE(MAX(order_no), 0) + 1 FROM sales
-             WHERE branch_id = ?1 AND date(at) = date('now', 'localtime'))) RETURNING id, order_no",
+        &format!(
+            "INSERT INTO sales (branch_id, shift_id, user_id, payment, status, till, order_no)
+             VALUES (?1, ?2, ?3, '', 'open', {TILL}, (SELECT COALESCE(MAX(order_no), ({TILL} - 1) * 1000) + 1
+                 FROM sales WHERE branch_id = ?1 AND till = {TILL} AND date(at) = date('now', 'localtime')))
+             RETURNING id, order_no"
+        ),
         params![s.branch_id, shift.id, s.user.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -822,7 +923,10 @@ pub fn record_sale(
         }
         None => {
             let id = tx.query_row(
-                "INSERT INTO sales (branch_id, shift_id, user_id, payment, status) VALUES (?1, ?2, ?3, '', 'open') RETURNING id",
+                &format!(
+                    "INSERT INTO sales (branch_id, shift_id, user_id, payment, status, till)
+                     VALUES (?1, ?2, ?3, '', 'open', {TILL}) RETURNING id"
+                ),
                 params![s.branch_id, shift.id, s.user.id],
                 |r| r.get(0),
             )?;
@@ -969,6 +1073,45 @@ const MPESA: &str =
 const STOCK: &str = "FROM products p LEFT JOIN batch_stock b ON b.product_id = p.id AND b.branch_id = ?1
     AND b.expiry >= date('now', 'localtime') WHERE p.is_active = 1 GROUP BY p.id";
 
+// ---------- Smart stock suggestions ----------
+//
+// Sales speed = units sold in the last 30 days ÷ 30. An order should last
+// `COVER_DAYS` after it arrives, and arriving takes `LEAD_DAYS`; a medicine
+// is suggested once its stock would run out within `WARN_DAYS`. Batches are
+// sold earliest expiry first, so a batch "will sell" what the speed allows
+// before its expiry, after the batches ahead of it.
+
+const COVER_DAYS: i64 = 30;
+const LEAD_DAYS: i64 = 7;
+const WARN_DAYS: i64 = 21;
+
+/// Each active medicine's sellable stock and sales speed. ?1 = branch.
+const SPEED: &str = "WITH sold AS (
+        SELECT si.product_id AS id, SUM(si.qty) AS units FROM sales sa JOIN sale_items si ON si.sale_id = sa.id
+        WHERE sa.branch_id = ?1 AND sa.status = 'done' AND sa.at >= datetime('now', 'localtime', '-30 days')
+        GROUP BY si.product_id),
+    speed AS (
+        SELECT p.id, p.code, p.name, COALESCE(SUM(b.qty), 0) AS stock,
+               COALESCE((SELECT units FROM sold WHERE sold.id = p.id), 0) AS sold,
+               COALESCE((SELECT units FROM sold WHERE sold.id = p.id), 0) / 30.0 AS per_day
+        FROM products p LEFT JOIN batch_stock b ON b.product_id = p.id AND b.branch_id = ?1
+            AND b.expiry >= date('now', 'localtime')
+        WHERE p.is_active = 1 GROUP BY p.id)";
+
+/// Medicines to order: (id, units to order), the soonest to run out first.
+/// Shown on Stock as one-tap picks that fill in the quantity.
+pub fn running_out(conn: &Connection, branch: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+    let sql = format!(
+        "{SPEED} SELECT id, CAST(per_day * {days} + 0.999 AS INTEGER) - stock FROM speed
+         WHERE per_day > 0 AND stock < per_day * {WARN_DAYS} AND per_day * {days} > stock
+         ORDER BY stock / per_day LIMIT ?2",
+        days = COVER_DAYS + LEAD_DAYS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![branch, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Runs a report. The first column of each query is the row key (not shown);
 /// columns named "... (KSh)" hold cents and are shown as money.
 pub fn report(conn: &Connection, kind: Report, branch: &str, from: &str, to: &str) -> Result<Table> {
@@ -1038,10 +1181,37 @@ pub fn report(conn: &Connection, kind: Report, branch: &str, from: &str, to: &st
              {STOCK} ORDER BY p.name COLLATE NOCASE"
         ),
         Report::Reorder => format!(
-            "SELECT p.id, p.code AS \"Code\", p.name AS \"Medicine\", COALESCE(SUM(b.qty), 0) AS \"In stock\",
-                    CASE WHEN COALESCE(SUM(b.qty), 0) < 10 THEN 'Below 10 — reorder now'
-                         WHEN COALESCE(SUM(b.qty), 0) < 25 THEN 'Below 25' ELSE 'Below 50' END AS \"Alert\"
-             {STOCK} HAVING COALESCE(SUM(b.qty), 0) < 50 ORDER BY 4, p.name COLLATE NOCASE"
+            "{SPEED} SELECT id, code AS \"Code\", name AS \"Medicine\", stock AS \"In stock\",
+                    sold AS \"Sold (30 days)\",
+                    CASE WHEN per_day > 0 THEN CAST(stock / per_day AS INTEGER) END AS \"Lasts (days)\",
+                    CASE WHEN per_day > 0 THEN MAX(0, CAST(per_day * {days} + 0.999 AS INTEGER) - stock)
+                         ELSE '' END AS \"Order (units)\",
+                    CASE WHEN stock <= 0 THEN 'Out of stock'
+                         WHEN per_day = 0 THEN 'Low stock, no sales in 30 days'
+                         ELSE 'Runs out in about ' || CAST(stock / per_day AS INTEGER) || ' days' END AS \"Why\"
+             FROM speed WHERE (per_day > 0 AND stock < per_day * {WARN_DAYS}) OR stock < 10
+             ORDER BY per_day = 0, stock / MAX(per_day, 0.0001), name COLLATE NOCASE",
+            days = COVER_DAYS + LEAD_DAYS
+        ),
+        Report::ExpiryRisk => format!(
+            "{SPEED}, shelf AS (
+                 SELECT b.id, b.product_id, p.name, b.batch_no, b.expiry, b.qty, b.cost_cents,
+                        julianday(b.expiry) - julianday(date('now', 'localtime')) AS days,
+                        COALESCE(SUM(b.qty) OVER (PARTITION BY b.product_id ORDER BY b.expiry, b.received_at
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS ahead
+                 FROM batch_stock b JOIN products p ON p.id = b.product_id
+                 WHERE b.branch_id = ?1 AND b.qty > 0 AND b.expiry >= date('now', 'localtime')),
+             risk AS (
+                 SELECT shelf.*, COALESCE(speed.per_day, 0) AS per_day,
+                        MIN(shelf.qty, MAX(0, CAST(COALESCE(speed.per_day, 0) * days - ahead AS INTEGER))) AS sells
+                 FROM shelf LEFT JOIN speed ON speed.id = shelf.product_id)
+             SELECT id, name AS \"Medicine\", batch_no AS \"Batch\", expiry AS \"Expiry\",
+                    CAST(days AS INTEGER) AS \"Days left\", qty AS \"Qty\", sells AS \"Will sell (est.)\",
+                    qty - sells AS \"Won't sell\", (qty - sells) * cost_cents AS \"Value at risk (KSh)\",
+                    CASE WHEN per_day = 0 THEN 'Not selling: return or discount it'
+                         WHEN days < 60 THEN 'Discount it or return it now'
+                         ELSE 'Sell this batch first; order less' END AS \"Advice\"
+             FROM risk WHERE qty > sells AND days <= 365 ORDER BY expiry, name COLLATE NOCASE"
         ),
         Report::Expiry => "SELECT b.id, p.name AS \"Medicine\", b.batch_no AS \"Batch\", b.expiry AS \"Expiry\",
                     CAST(julianday(b.expiry) - julianday(date('now', 'localtime')) AS INTEGER) AS \"Days left\",
@@ -1137,6 +1307,24 @@ mod tests {
 
     fn stock(conn: &Connection, s: &Session) -> i64 {
         list_products(conn, &s.branch_id).unwrap()[0].stock
+    }
+
+    #[test]
+    fn staff_rules() {
+        let (conn, kelvin) = owner();
+        let ann = User { id: String::new(), name: "Ann".into(), role: Role::Owner, active: true };
+        save_user(&conn, &kelvin, &ann, Some("5678")).unwrap();
+        let ann = list_users(&conn, true).unwrap().into_iter().find(|u| u.name == "Ann").unwrap();
+        assert!(save_user(&conn, &kelvin, &User { active: false, ..kelvin.user.clone() }, None).is_err());
+        assert!(save_user(&conn, &kelvin, &User { role: Role::Cashier, ..kelvin.user.clone() }, None).is_err());
+        assert!(delete_user(&conn, &kelvin, &kelvin.user).is_err(), "nobody deletes themselves");
+        save_user(&conn, &kelvin, &User { active: false, ..ann.clone() }, None).unwrap();
+        assert!(login(&conn, &ann.id, "5678").unwrap().is_none(), "another owner can be blocked");
+        save_user(&conn, &kelvin, &User { role: Role::Cashier, active: true, ..ann.clone() }, None).unwrap();
+        assert!(login(&conn, &ann.id, "5678").unwrap().is_some());
+        delete_user(&conn, &kelvin, &ann).unwrap();
+        assert!(list_users(&conn, true).unwrap().iter().all(|u| u.name != "Ann"));
+        assert!(login(&conn, &ann.id, "5678").unwrap().is_none(), "deleted staff can't log in");
     }
 
     #[test]
@@ -1322,6 +1510,30 @@ mod tests {
         assert_eq!(list_products(&conn, &owner.branch_id).unwrap()[1].stock, 1, "their stock is free again");
         let unpaid = report(&conn, Report::UnpaidOrders, &owner.branch_id, "2000-01-01", "2100-01-01").unwrap();
         assert_eq!(unpaid.rows[0].last().unwrap(), "cancelled");
+    }
+
+    #[test]
+    fn stock_suggestions() {
+        let (conn, s) = owner();
+        let (fast, slow) = (add_medicine(&conn, &s, "Panadol", false), add_medicine(&conn, &s, "Zentel", false));
+        let soon = (chrono::Local::now().date_naive() + chrono::Duration::days(30)).to_string();
+        let lines = vec![line(&fast, "P1", "2099-01-01", 10), line(&slow, "Z1", &soon, 20)];
+        receive(&conn, &s, &Delivery { lines, ..Delivery::default() }).unwrap();
+        open_shift(&conn, &s).unwrap();
+        let sell = |id: &str, qty| {
+            record_sale(&conn, &s, None, &[CartLine { product_id: id.into(), qty }], Payment::Cash, None, None).unwrap()
+        };
+        sell(&fast, 6); // 0.2 a day: the 4 left last 20 days
+        sell(&slow, 3); // 0.1 a day: 3 more sell before expiry, 14 won't
+        // Enough for 30 days plus a week's delivery: ceil(0.2 × 37) − 4 = 4.
+        assert_eq!(running_out(&conn, &s.branch_id, 5).unwrap(), vec![(fast.clone(), 4)]);
+        let reorder = report(&conn, Report::Reorder, &s.branch_id, "", "").unwrap();
+        assert_eq!(reorder.rows[0][1..6], ["Panadol", "4", "6", "20", "4"]);
+        let risk = report(&conn, Report::ExpiryRisk, &s.branch_id, "", "").unwrap();
+        assert_eq!(risk.rows.len(), 1);
+        assert_eq!(risk.rows[0][0..2], ["Zentel", "Z1"]);
+        assert_eq!(risk.rows[0][4..7], ["17", "3", "14"]);
+        assert_eq!(risk.rows[0][8], "Discount it or return it now");
     }
 
     #[test]

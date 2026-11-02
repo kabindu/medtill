@@ -9,3 +9,9 @@
 *.sqlite-shm
 /reports
 /receipts
+/training
+
+# Real shop data and local-only files: never on GitHub
+*.moved
+/models
+/Claude outputs

@@ -13,7 +13,7 @@ use crate::db;
 use crate::models::{
     Action, CartLine, Cents, Order, Payment, Product, Receipt, SellerTotals, Session, Shift, total_of,
 };
-use crate::ui::scan::{self, CameraScan};
+use crate::ui::scan;
 use crate::ui::theme::{self, Notice};
 use crate::validate;
 
@@ -27,7 +27,6 @@ pub struct PosState {
     paying: Option<Order>,
     /// The find box: a scanner types here; so does the seller (code or name).
     query: String,
-    camera: CameraScan,
     payment: Payment,
     cash_given: String,
     mpesa_code: String,
@@ -37,6 +36,7 @@ pub struct PosState {
     closing: bool,
     /// The shift just closed, shown as its Z report until the next one opens.
     closed: Option<Shift>,
+    picks: crate::ui::Cache<(Vec<String>, Vec<String>)>,
 }
 
 pub fn show(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut PosState) {
@@ -45,7 +45,7 @@ pub fn show(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut PosState
         Ok((
             db::current_shift(conn, &s.branch_id)?,
             db::list_products(conn, &s.branch_id)?,
-            db::quick_picks(conn, &s.branch_id, 8)?,
+            crate::ui::cached(&mut st.picks, || db::quick_picks(conn, &s.branch_id, 10))?,
             db::open_orders(conn, &s.branch_id)?,
         ))
     })();
@@ -83,11 +83,13 @@ fn held_note(p: &Product) -> String {
 fn finder(ui: &mut egui::Ui, s: &Session, st: &mut PosState, products: &[Product], picks: &(Vec<String>, Vec<String>)) {
     theme::section_title(ui, "Find medicines");
     let hint = "Scan, or type a code or name, then Enter";
-    if let Some(entered) = scan::barcode_box(ui, &mut st.query, &mut st.camera, "pos_find", hint, true) {
+    if let Some(entered) = scan::find_box(ui, &mut st.query, "pos_find", hint, true) {
         enter(st, s, products, &entered);
     }
+    // Five of each; a medicine already under Popular isn't repeated under Recent.
+    let recent: Vec<String> = picks.1.iter().filter(|id| !picks.0.contains(id)).cloned().collect();
     quick_picks(ui, s, st, products, "Popular", &picks.0);
-    quick_picks(ui, s, st, products, "Recent", &picks.1);
+    quick_picks(ui, s, st, products, "Recently sold", &recent);
     if products.is_empty() {
         return theme::muted(ui, "No medicines yet. They are added under Medicines.");
     }
@@ -99,7 +101,10 @@ fn finder(ui: &mut egui::Ui, s: &Session, st: &mut PosState, products: &[Product
         theme::cell(ui, w[0], h, |ui| theme::cell_text(ui, p.code.as_str()));
         theme::cell(ui, w[1], h, |ui| theme::cell_text(ui, egui::RichText::new(&p.name).strong()));
         theme::cell(ui, w[2], h, |ui| theme::number_cell(ui, p.price.to_string()));
-        theme::cell(ui, w[3], h, |ui| theme::number_cell(ui, held_note(p)));
+        theme::cell(ui, w[3], h, |ui| {
+            theme::stock_dot(ui, p.stock + p.held);
+            ui.label(held_note(p));
+        });
         theme::cell(ui, w[4], h, |ui| {
             if p.stock == 0 {
                 ui.colored_label(theme::STATUS_CRITICAL, "Out of stock");
@@ -134,19 +139,11 @@ fn enter(st: &mut PosState, s: &Session, products: &[Product], entered: &str) {
 
 /// A row of one-tap buttons (best sellers, or the latest sold).
 fn quick_picks(ui: &mut egui::Ui, s: &Session, st: &mut PosState, products: &[Product], label: &str, ids: &[String]) {
-    let picks: Vec<&Product> = ids.iter().filter_map(|id| products.iter().find(|p| &p.id == id)).collect();
-    if picks.is_empty() {
-        return;
+    let picks: Vec<&Product> = ids.iter().filter_map(|id| products.iter().find(|p| &p.id == id)).take(5).collect();
+    let items: Vec<(&str, bool)> = picks.iter().map(|p| (p.name.as_str(), p.stock > 0)).collect();
+    if let Some(i) = theme::chip_row(ui, label, &items) {
+        add(st, s, picks[i]);
     }
-    ui.horizontal_wrapped(|ui| {
-        ui.add_sized([70.0, 24.0], egui::Label::new(egui::RichText::new(label).color(theme::TEXT_SECONDARY)));
-        for p in picks {
-            let tap = ui.add_enabled_ui(p.stock > 0, |ui| theme::chip(ui, &p.name, false)).inner;
-            if tap.on_hover_text(p.label()).clicked() {
-                add(st, s, p);
-            }
-        }
-    });
 }
 
 /// How many of `p` the cart may hold: the free stock, plus what the order

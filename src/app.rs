@@ -1,5 +1,7 @@
-//! The window: first-time setup, the login (lock) screen, and — once
-//! someone is logged in — the navigation bar and the screen they picked.
+//! The window: first-time setup (a new shop, or joining another computer),
+//! the login (lock) screen, and — once someone is logged in — the
+//! navigation bar and the screen they picked. It also starts the sync with
+//! other computers and runs the Friday backup.
 
 use std::time::{Duration, Instant};
 
@@ -8,6 +10,8 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::models::{Action, Session};
+use crate::storage;
+use crate::sync::{self, Role};
 use crate::ui::theme::{self, Notice};
 use crate::ui::{admin, pos, products, reports, stock};
 use crate::validate;
@@ -17,6 +21,8 @@ const AUTO_LOCK: Duration = Duration::from_secs(3 * 60 * 60);
 /// After this many wrong PINs in a row, logging in pauses for `PAUSE`.
 const MAX_TRIES: u32 = 5;
 const PAUSE: Duration = Duration::from_secs(30);
+/// How often the till checks whether the Friday backup is due.
+const BACKUP_CHECK: Duration = Duration::from_secs(30 * 60);
 
 const NAV_MARGIN: egui::Margin = egui::Margin { left: 20, right: 20, top: 10, bottom: 10 };
 const PAGE_MARGIN: egui::Margin = egui::Margin { left: 24, right: 24, top: 16, bottom: 16 };
@@ -67,6 +73,10 @@ struct Login {
     branch: String,
     name: String,
     pin_again: String,
+    /// Joining a main computer instead of starting a new shop.
+    joining: bool,
+    main: String,
+    link: String,
 }
 
 pub struct MedTillApp {
@@ -83,10 +93,17 @@ pub struct MedTillApp {
     stock: stock::StockState,
     reports: reports::ReportsState,
     admin: admin::AdminState,
+    sync: sync::Shared,
+    /// A message for everyone (data moved, a backup that failed).
+    banner: Notice,
+    next_backup_check: Instant,
 }
 
 impl MedTillApp {
-    pub fn new(conn: Connection) -> Self {
+    /// `moved`: a note when the data was just moved to its new folder.
+    pub fn new(conn: Connection, moved: Option<String>) -> Self {
+        let sync = sync::Shared::default();
+        sync::start(&conn, storage::db_path(), &sync);
         Self {
             conn,
             session: None,
@@ -99,7 +116,50 @@ impl MedTillApp {
             stock: Default::default(),
             reports: Default::default(),
             admin: Default::default(),
+            sync,
+            banner: moved.map(Notice::success).unwrap_or_default(),
+            next_backup_check: Instant::now(),
         }
+    }
+
+    /// The Friday backup, checked now and then (it takes a second when due).
+    fn backup_if_due(&mut self) {
+        if Instant::now() < self.next_backup_check {
+            return;
+        }
+        self.next_backup_check = Instant::now() + BACKUP_CHECK;
+        if let Some(Err(e)) = storage::auto_backup(&self.conn) {
+            self.banner = Notice::error(format!("The Friday backup failed: {e}"));
+        }
+    }
+
+    /// The sync's state for the menu bar: a colour, a word or two, and the
+    /// details shown on hover. Nothing when this is the only computer.
+    fn sync_badge(&self) -> Option<(egui::Color32, String, String)> {
+        let status = self.sync.lock().ok()?;
+        let fresh = |at: &Instant| at.elapsed() < Duration::from_secs(40);
+        let problem = status.problem.clone().unwrap_or_default();
+        let (till, main, _) = sync::details(&self.conn);
+        Some(match sync::role(&self.conn) {
+            Role::Alone => return None,
+            Role::Main if !problem.is_empty() && status.last_ok.is_none_or(|t| !fresh(&t)) => {
+                (theme::STATUS_CRITICAL, "Tills can't connect".into(), problem)
+            }
+            Role::Main => {
+                let online = status.tills.values().filter(|t| fresh(t)).count();
+                let why = format!("This is the main computer. {online} other till(s) synced in the last 40 seconds.");
+                (theme::STATUS_GOOD, format!("Main · {online} online"), why)
+            }
+            Role::Till if status.last_ok.as_ref().is_some_and(fresh) => (
+                theme::STATUS_GOOD,
+                format!("Till {till} · synced"),
+                format!("Linked to {main}; syncs every 10 seconds."),
+            ),
+            Role::Till => {
+                let why = format!("Sales are kept on this computer and sent when {main} is back. {problem}");
+                (theme::STATUS_SERIOUS, format!("Till {till} · offline"), why)
+            }
+        })
     }
 
     fn start(&mut self, session: Session) {
@@ -126,6 +186,19 @@ impl MedTillApp {
     fn setup_screen(&mut self, ui: &mut egui::Ui) {
         let l = &mut self.login;
         theme::section_title(ui, "Welcome — let's set up MedTill");
+        ui.horizontal(|ui| {
+            if theme::chip(ui, "A new shop", !l.joining).clicked() {
+                l.joining = false;
+            }
+            if theme::chip(ui, "Join a shop on another computer", l.joining).clicked() {
+                l.joining = true;
+            }
+        });
+        ui.add_space(8.0);
+        if l.joining {
+            return self.join_screen(ui);
+        }
+        let l = &mut self.login;
         theme::muted(ui, "You'll be the owner. You can add your staff after this.");
         theme::form(ui, "setup", |ui| {
             theme::field(ui, "Branch name", &mut l.branch, "e.g. Kiambu Road Pharmacy");
@@ -146,6 +219,33 @@ impl MedTillApp {
             match result {
                 Ok(session) => self.start(session),
                 Err(e) => self.login.notice = Notice::error(e),
+            }
+        }
+    }
+
+    /// A second computer joins the main one and becomes the next till.
+    fn join_screen(&mut self, ui: &mut egui::Ui) {
+        let l = &mut self.login;
+        theme::muted(
+            ui,
+            "On the main computer, open Staff & settings → Other computers. It shows its name and a link code.",
+        );
+        theme::form(ui, "join", |ui| {
+            theme::field(ui, "Main computer", &mut l.main, "its name or address, e.g. DESKTOP-2VPR9IB");
+            theme::field(ui, "Link code", &mut l.link, "e.g. 3F9A1C2E");
+        });
+        if theme::big_button(ui, "Join").clicked() {
+            match sync::join(&self.conn, &l.main, &l.link) {
+                Ok(till) => {
+                    sync::start(&self.conn, storage::db_path(), &self.sync);
+                    self.login = Login {
+                        notice: Notice::success(format!(
+                            "This computer is now till {till}. Log in with your usual name and PIN."
+                        )),
+                        ..Default::default()
+                    };
+                }
+                Err(e) => l.notice = Notice::error(e),
             }
         }
     }
@@ -207,26 +307,48 @@ impl MedTillApp {
         let mut lock = false;
         egui::Panel::top("nav").show(ui, |ui| {
             egui::Frame::NONE.inner_margin(NAV_MARGIN).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("MedTill").heading().strong().color(theme::ACCENT));
-                    theme::muted(ui, "pharmacy point of sale");
-                    ui.separator();
-                    for screen in Screen::ALL.into_iter().filter(|screen| s.can(screen.needs())) {
-                        if theme::tab(ui, screen.label(), self.screen == screen).clicked() {
-                            self.screen = screen;
-                            self.reports.refresh();
+                // Menu on the left, who and where on the right. When the window
+                // is narrow the right side shortens its text instead of
+                // drawing over the menu.
+                let badge = self.sync_badge();
+                let branch = db::branch_name(&self.conn).unwrap_or_default();
+                egui::Sides::new().shrink_right().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.label(egui::RichText::new("MedTill").heading().strong().color(theme::ACCENT));
+                        ui.separator();
+                        for screen in Screen::ALL.into_iter().filter(|screen| s.can(screen.needs())) {
+                            if theme::tab(ui, screen.label(), self.screen == screen).clicked() {
+                                self.screen = screen;
+                                self.reports.refresh();
+                            }
                         }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    },
+                    |ui| {
                         lock = ui.button("Lock").clicked();
-                        let branch = db::branch_name(&self.conn).unwrap_or_default();
-                        theme::muted(ui, format!("{} · {} · {branch}", s.user.name, s.user.role.label()));
-                    });
-                });
+                        if let Some((colour, text, why)) = badge {
+                            theme::status_badge(ui, colour, &text).on_hover_text(why);
+                        }
+                        let who = format!("{} · {} · {branch}", s.user.name, s.user.role.label());
+                        ui.add(egui::Label::new(egui::RichText::new(who).color(theme::TEXT_SECONDARY)).truncate());
+                    },
+                );
             });
         });
         if lock {
             return self.lock();
+        }
+        if !matches!(self.banner, Notice::None) {
+            egui::Panel::top("banner").show(ui, |ui| {
+                egui::Frame::NONE.inner_margin(NAV_MARGIN).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        self.banner.show(ui);
+                        if theme::quiet_button(ui, "OK").clicked() {
+                            self.banner = Notice::None;
+                        }
+                    });
+                });
+            });
         }
         if !s.can(self.screen.needs()) {
             self.screen = Screen::Checkout;
@@ -239,7 +361,7 @@ impl MedTillApp {
                     Screen::Medicines => products::show(ui, conn, s, &mut self.products),
                     Screen::Stock => stock::show(ui, conn, s, &mut self.stock),
                     Screen::Reports => reports::show(ui, conn, s, &mut self.reports),
-                    Screen::Admin => admin::show(ui, conn, s, &mut self.admin),
+                    Screen::Admin => admin::show(ui, conn, s, &mut self.admin, &self.sync),
                 }
             });
         });
@@ -254,8 +376,10 @@ impl eframe::App for MedTillApp {
         if self.session.is_some() && self.last_input.elapsed() > AUTO_LOCK {
             self.lock();
         }
-        // Wake up now and then even when idle, so the auto-lock can fire.
+        // Wake up now and then even when idle, so the auto-lock can fire
+        // and changes synced from other tills show up.
         ui.ctx().request_repaint_after(Duration::from_secs(5));
+        self.backup_if_due();
 
         match self.session.clone() {
             Some(session) => self.main_screen(ui, &session),
@@ -275,6 +399,7 @@ impl eframe::App for MedTillApp {
                                     Err(e) => Notice::error(e).show(ui),
                                 }
                                 self.login.notice.show(ui);
+                                self.banner.show(ui);
                             });
                         });
                     });

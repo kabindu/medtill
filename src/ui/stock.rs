@@ -8,7 +8,8 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::models::{Action, Batch, Cents, Delivery, DeliveryLine, Product, Session};
-use crate::ui::scan::{self, CameraScan};
+use crate::scanner::Found;
+use crate::ui::scan::{self, BoxScan};
 use crate::ui::theme::{self, Notice};
 use crate::validate;
 
@@ -23,7 +24,9 @@ pub struct StockState {
     delivery: Delivery,
     // Finding the medicine for the next line.
     query: String,
-    camera: CameraScan,
+    scan: BoxScan,
+    /// What was read off the box; the reader learns from it when its line is added.
+    scan_found: Option<Found>,
     product: Option<String>, // id
     new_medicine: Option<Product>,
     new_price: String,
@@ -43,6 +46,16 @@ pub struct StockState {
     focus_adjust: bool,
     top_ups: Delivery,
     shelf_notice: Notice,
+    picks: crate::ui::Cache<Picks>,
+}
+
+/// One-tap picks on step 1: medicines checked in lately, popular ones, and
+/// the ones about to run out with how many to order (from sales speed).
+#[derive(Clone, Default)]
+struct Picks {
+    recent: Vec<String>,
+    popular: Vec<String>,
+    running_out: Vec<(String, i64)>,
 }
 
 pub fn show(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockState) {
@@ -51,7 +64,13 @@ pub fn show(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockSta
         Ok((
             db::list_products(conn, &s.branch_id)?,
             db::list_batches(conn, &s.branch_id)?,
-            [db::recent_check_ins(conn, &s.branch_id, 8)?, db::quick_picks(conn, &s.branch_id, 8)?.0],
+            crate::ui::cached(&mut st.picks, || {
+                Ok(Picks {
+                    recent: db::recent_check_ins(conn, &s.branch_id, 5)?,
+                    popular: db::quick_picks(conn, &s.branch_id, 10)?.0,
+                    running_out: db::running_out(conn, &s.branch_id, 5)?,
+                })
+            })?,
         ))
     })();
     let (products, batches, picks) = match loaded {
@@ -64,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockSta
         FORM_WIDTH,
         st,
         |ui, st| check_in_form(ui, conn, s, st, &products, &picks),
-        |ui, st| shelf(ui, conn, s, st, &batches),
+        |ui, st| shelf(ui, conn, s, st, &batches, &products),
     );
 }
 
@@ -76,11 +95,14 @@ fn check_in_form(
     s: &Session,
     st: &mut StockState,
     products: &[Product],
-    picks: &[Vec<String>; 2],
+    picks: &Picks,
 ) {
     theme::section_title(ui, "Check in stock");
     theme::panel(ui, |ui| {
         theme::step(ui, 1, "Find the medicine");
+        if let Some(found) = scan::box_scan(ui, conn, &mut st.scan, products) {
+            use_scan(st, found, products);
+        }
         find_medicine(ui, conn, s, st, products, picks);
 
         theme::step(ui, 2, "Quantity, cost, batch and expiry");
@@ -99,9 +121,17 @@ fn check_in_form(
         if ui.button("+ Add line").clicked() || add_line {
             match build_line(st, products) {
                 Ok(line) => {
+                    st.notice = Notice::None;
+                    if let Some(found) = st.scan_found.take() {
+                        let category = products.iter().find(|p| p.id == line.product_id).map(|p| p.category.as_str());
+                        let learned =
+                            scan::learn(conn, &found, &line.product_id, &line.product_name, category.unwrap_or(""));
+                        if let Err(e) = learned {
+                            st.notice = Notice::error(format!("Line added, but {e}."));
+                        }
+                    }
                     st.delivery.lines.push(line);
                     (st.product, st.qty, st.cost, st.batch_no, st.expiry) = Default::default();
-                    st.notice = Notice::None;
                 }
                 Err(e) => st.notice = Notice::error(e),
             }
@@ -151,12 +181,13 @@ fn find_medicine(
     s: &Session,
     st: &mut StockState,
     products: &[Product],
-    picks: &[Vec<String>; 2],
+    picks: &Picks,
 ) {
     if let Some(p) = st.product.as_ref().and_then(|id| products.iter().find(|p| &p.id == id)) {
         let mut change = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(p.label()).strong().size(18.0).color(theme::ACCENT_STRONG));
+            theme::stock_level(ui, p.stock + p.held);
             theme::muted(ui, format!("{} on the shelf", p.stock + p.held));
             change = theme::quiet_button(ui, "Change").clicked();
         });
@@ -165,9 +196,9 @@ fn find_medicine(
         }
         return;
     }
-    let hint = "Scan, or type barcode / code / name, then Enter";
+    let hint = "Type a code or name, then Enter";
     let autofocus = st.new_medicine.is_none();
-    if let Some(entered) = scan::barcode_box(ui, &mut st.query, &mut st.camera, "receive_find", hint, autofocus) {
+    if let Some(entered) = scan::find_box(ui, &mut st.query, "receive_find", hint, autofocus) {
         let hits: Vec<&Product> = products.iter().filter(|p| p.matches(&entered)).collect();
         match (products.iter().find(|p| p.is_exactly(&entered)), hits.as_slice()) {
             (Some(p), _) | (None, &[p]) => choose(st, p),
@@ -184,7 +215,7 @@ fn find_medicine(
                 theme::field(ui, "Name", &mut draft.name, "e.g. Panadol 500mg");
                 theme::field(ui, "Selling price (KSh)", &mut st.new_price, "e.g. 250.00");
                 theme::field(ui, "Code", &mut draft.code, "leave empty for the next number");
-                theme::field(ui, "Barcode", draft.barcode.get_or_insert_default(), "optional");
+                theme::field(ui, "Category", &mut draft.category, "e.g. Painkiller");
             });
             theme::actions(ui, |ui| {
                 if theme::primary_button(ui, "Save and use it").clicked() {
@@ -207,19 +238,29 @@ fn find_medicine(
         return;
     }
     if query.is_empty() {
-        for (label, ids) in [("Recently checked in", &picks[0]), ("Popular", &picks[1])] {
-            let found: Vec<&Product> = ids.iter().filter_map(|id| products.iter().find(|p| &p.id == id)).collect();
-            if found.is_empty() {
-                continue;
+        // Running out first, each with the quantity to order filled in.
+        let short: Vec<(&Product, i64)> = picks
+            .running_out
+            .iter()
+            .filter_map(|(id, qty)| products.iter().find(|p| &p.id == id).map(|p| (p, *qty)))
+            .collect();
+        let labels: Vec<String> = short.iter().map(|(p, qty)| format!("{} · order {qty}", p.name)).collect();
+        let items: Vec<(&str, bool)> = labels.iter().map(|l| (l.as_str(), true)).collect();
+        if let Some(i) = theme::chip_row(ui, "Running out (from sales speed)", &items) {
+            choose(st, short[i].0);
+            st.qty = short[i].1.to_string();
+        }
+        // Five of each; a medicine already under "Recently checked in" isn't repeated.
+        let popular = picks.popular.iter().filter(|id| !picks.recent.contains(id));
+        for (label, ids) in
+            [("Recently checked in", picks.recent.iter().collect::<Vec<_>>()), ("Popular", popular.collect())]
+        {
+            let found: Vec<&Product> =
+                ids.iter().filter_map(|id| products.iter().find(|p| &&p.id == id)).take(5).collect();
+            let items: Vec<(&str, bool)> = found.iter().map(|p| (p.name.as_str(), true)).collect();
+            if let Some(i) = theme::chip_row(ui, label, &items) {
+                choose(st, found[i]);
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.add_sized([150.0, 24.0], egui::Label::new(egui::RichText::new(label).color(theme::TEXT_SECONDARY)));
-                for p in found {
-                    if theme::chip(ui, &p.name, false).on_hover_text(p.label()).clicked() {
-                        choose(st, p);
-                    }
-                }
-            });
         }
         if ui.button("+ New medicine").clicked() {
             st.new_medicine = Some(Product::default());
@@ -238,12 +279,7 @@ fn find_medicine(
         theme::muted(ui, format!("No medicine matches \"{query}\"."));
     }
     if ui.button(format!("+ Add \"{query}\" as a new medicine")).clicked() {
-        let barcode = query.chars().all(|c| c.is_ascii_digit()) && query.len() >= 8;
-        st.new_medicine = Some(Product {
-            name: if barcode { String::new() } else { query.clone() },
-            barcode: barcode.then_some(query),
-            ..Product::default()
-        });
+        st.new_medicine = Some(Product { name: query, ..Product::default() });
     }
 }
 
@@ -257,11 +293,36 @@ fn choose(st: &mut StockState, p: &Product) {
     st.notice = Notice::None;
 }
 
+/// Details read off a box: a medicine already listed is picked, a new one
+/// opens the new-medicine form; the batch and expiry go into step 2.
+fn use_scan(st: &mut StockState, found: Found, products: &[Product]) {
+    let known = found.product_id.as_deref().and_then(|id| products.iter().find(|p| p.id == id));
+    match known {
+        Some(p) => choose(st, p),
+        None => {
+            st.product = None;
+            st.new_medicine =
+                Some(Product { name: found.name.clone(), category: found.category.clone(), ..Product::default() });
+        }
+    }
+    if !found.batch.is_empty() {
+        st.batch_no = found.batch.clone();
+    }
+    if let Some(expiry) = found.expiry {
+        st.expiry = expiry.to_string();
+    }
+    st.scan_found = Some(found);
+    st.notice = Notice::success(match known {
+        Some(_) => "Read from the box: check the batch and expiry, then add the line.",
+        None => "A new medicine: check its name and category, add the price and save it.",
+    });
+}
+
 fn save_new_medicine(conn: &Connection, s: &Session, draft: &Product, price: &str) -> Result<String, String> {
     let medicine = Product {
         name: validate::parse_name("Name", &draft.name)?,
         code: validate::parse_code(&draft.code)?.unwrap_or_default(),
-        barcode: validate::parse_barcode(draft.barcode.as_deref().unwrap_or_default())?,
+        category: draft.category.trim().to_string(),
         price: validate::parse_price("Selling price", price)?,
         ..Product::default()
     };
@@ -270,6 +331,7 @@ fn save_new_medicine(conn: &Connection, s: &Session, draft: &Product, price: &st
 
 fn record(conn: &Connection, s: &Session, st: &mut StockState) -> Result<String, String> {
     db::receive(conn, s, &st.delivery)?;
+    st.picks = None; // show this check-in under "Recently checked in" now
     let lines = std::mem::take(&mut st.delivery).lines.len();
     Ok(format!("Checked in: {lines} lines are now on the shelf."))
 }
@@ -294,7 +356,14 @@ fn build_line(st: &StockState, products: &[Product]) -> Result<DeliveryLine, Str
 
 // ---------- The shelf ----------
 
-fn shelf(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockState, batches: &[Batch]) {
+fn shelf(
+    ui: &mut egui::Ui,
+    conn: &Connection,
+    s: &Session,
+    st: &mut StockState,
+    batches: &[Batch],
+    products: &[Product],
+) {
     theme::section_title(ui, "On the shelf — earliest expiry first");
     if let Some(b) = st.adjusting.as_ref().and_then(|id| batches.iter().find(|b| &b.id == id)) {
         adjust_panel(ui, conn, s, st, b);
@@ -313,9 +382,12 @@ fn shelf(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockState,
     let pending = |b: &Batch| -> i64 {
         st.top_ups.lines.iter().filter(|l| l.batch_id.as_deref() == Some(b.id.as_str())).map(|l| l.qty).sum()
     };
-    let headers = ["Medicine", "Batch", "Expiry", "Days left", "Qty", "Value (KSh)", ""];
+    // The medicine's stock level across all its batches.
+    let level = |b: &Batch| products.iter().find(|p| p.id == b.product_id).map_or(0, |p| p.stock + p.held);
+    let headers = ["Medicine", "Batch", "Expiry", "Days left", "Qty", "Value (KSh)", "Stock level", ""];
+    let widths = [0.0, 100.0, 100.0, 80.0, 80.0, 100.0, 140.0, 90.0];
     let mut clicked = None;
-    theme::long_list(ui, "shelf", &headers, &[0.0, 110.0, 100.0, 80.0, 80.0, 110.0, 90.0], shown.len(), |ui, i, w| {
+    theme::long_list(ui, "shelf", &headers, &widths, shown.len(), |ui, i, w| {
         let (b, h) = (shown[i], theme::ROW_HEIGHT);
         let days = (b.expiry - today).num_days();
         let colour = match days {
@@ -336,7 +408,8 @@ fn shelf(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut StockState,
             more => theme::number_cell(ui, format!("{} (+{more})", b.qty)),
         });
         theme::cell(ui, w[5], h, |ui| theme::number_cell(ui, (b.cost * b.qty).to_string()));
-        theme::cell(ui, w[6], h, |ui| {
+        theme::cell(ui, w[6], h, |ui| theme::stock_level(ui, level(b)));
+        theme::cell(ui, w[7], h, |ui| {
             if ui.button("Adjust").on_hover_text("Add new stock, write off or count").clicked() {
                 clicked = Some((b.id.clone(), days));
             }
@@ -486,6 +559,7 @@ fn top_up_list(ui: &mut egui::Ui, conn: &Connection, s: &Session, st: &mut Stock
     } else if save {
         st.shelf_notice = match db::receive(conn, s, &st.top_ups) {
             Ok(()) => {
+                st.picks = None;
                 let lines = std::mem::take(&mut st.top_ups).lines.len();
                 Notice::success(format!("Stock updated: {units} units added in {lines} lines."))
             }

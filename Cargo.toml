@@ -8,9 +8,17 @@ argon2 = { version = "0.5.3", features = ["std"] }
 chrono = "0.4.45"
 eframe = "0.35.0"
 egui = "0.35.0"
+image = { version = "0.25", default-features = false }
 nokhwa = { version = "0.10.11", features = ["input-native"] }
+ocr-rs = "2.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-rxing = "0.9.3"
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Smaller, faster MedTill.exe for the shop (cargo build --release).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
